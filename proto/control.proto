@@ -1,0 +1,140 @@
+syntax = "proto3";
+
+// The control plane mirrors SIP's INVITE/BYE semantics without a SIP stack.
+// StartCall negotiates the media parameters and returns a call ID and the port
+// to send RTP to; EndCall tears the call down and exchanges each side's view of
+// what happened.
+//
+// It exists because four things are impossible to get right from the media
+// stream alone:
+//
+//  1. Packet loss at the edges of a stream. A receiver reconstructs loss from
+//     gaps between sequence numbers that arrived, so it cannot detect loss at
+//     either end: nothing later reveals a trailing gap, and nothing earlier
+//     anchors a leading one — a receiver whose first packet was dropped simply
+//     starts counting one packet in. EndCall carries both ends of the range
+//     the sender emitted, which closes the blind spot. Real endpoints learn
+//     the same range from RTCP.
+//
+//  2. Knowing when a call ended. Without a teardown message the gateway has to
+//     infer the end from silence, which means it keeps filling playout slots
+//     with concealment for as long as its hangover window lasts, inflating the
+//     conceal rate of every call.
+//
+//  3. The return media path. The gateway synthesizes audio but has nowhere to
+//     send it until the caller says where to listen.
+//
+//  4. The client's network impairment profile. Nothing in an RTP stream says
+//     how it was degraded, so the gateway cannot otherwise label a call with
+//     the conditions it was sent under.
+package voicedemo.control.v1;
+
+option go_package = "github.com/mharner33/voice-demo/proto/controlpb;controlpb";
+
+service ControlPlane {
+  // StartCall negotiates media parameters, the SIP INVITE analogue.
+  rpc StartCall(StartCallRequest) returns (StartCallResponse);
+
+  // EndCall tears a call down, the SIP BYE analogue, and exchanges each side's
+  // accounting so the two can be reconciled.
+  rpc EndCall(EndCallRequest) returns (EndCallResponse);
+}
+
+// Codec is the G.711 variant for a call.
+enum Codec {
+  CODEC_UNSPECIFIED = 0;
+  CODEC_PCMU = 1; // G.711 u-law, RTP payload type 0
+  CODEC_PCMA = 2; // G.711 A-law, RTP payload type 8
+}
+
+message StartCallRequest {
+  // Caller and callee identifiers. Free-form; they appear in the call log and
+  // on the trace, as a SIP From/To would.
+  string from = 1;
+  string to = 2;
+
+  Codec codec = 3;
+
+  // The synchronization source the client will use on its RTP stream. This is
+  // what binds the signaled call to the media that follows, the way SDP binds
+  // a session to its RTP.
+  uint32 ssrc = 4;
+
+  // Where to send synthesized audio back. The gateway combines this port with
+  // the source address it observes on the inbound RTP, which is what makes the
+  // return path work from behind NAT. Zero means the client is not listening
+  // and the gateway should not send audio back.
+  uint32 return_port = 5;
+
+  // The network impairment profile the client is applying to its own outbound
+  // stream. The gateway cannot discover this from the media, so the client has
+  // to declare it for the call to be labeled honestly.
+  string network_profile = 6;
+
+  // Packetization interval. Only 20 ms is supported; the field exists so a
+  // mismatch is rejected explicitly rather than producing silently wrong
+  // timestamp arithmetic.
+  uint32 ptime_ms = 7;
+}
+
+message StartCallResponse {
+  // The gateway's identifier for the call. It is the Agent Observability
+  // session ID and the call log's key.
+  string call_id = 1;
+
+  // Where to send RTP.
+  uint32 media_port = 2;
+
+  // The negotiated codec, which may differ from the request only by the
+  // gateway rejecting it outright.
+  Codec codec = 3;
+
+  // The APM trace this call will be recorded under, so the client can print a
+  // link rather than having to search for it.
+  string trace_id = 4;
+}
+
+message EndCallRequest {
+  string call_id = 1;
+
+  // What the sender knows it did. The gateway measures the same things
+  // independently from the stream; agreement between the two is the evidence
+  // that the loss accounting is correct.
+  //
+  // first_sequence and final_sequence are the load-bearing fields: the
+  // sequence numbers of the first and last packets the sender emitted,
+  // including any it dropped itself. They are what let the gateway account for
+  // loss at the edges of the stream. Both are needed — the blind spot is
+  // symmetric.
+  uint64 frames_offered = 2;
+  uint64 packets_sent = 3;
+  uint64 packets_dropped = 4;
+  uint32 final_sequence = 5;
+  bool have_final_sequence = 6;
+  uint32 first_sequence = 8;
+  bool have_first_sequence = 9;
+
+  // Why the call ended, for the call log.
+  string reason = 7;
+}
+
+message EndCallResponse {
+  // The gateway's independent view, so the client can print a reconciliation
+  // and a demo can show the two agreeing.
+  uint64 packets_received = 1;
+  uint64 packets_expected = 2;
+  uint64 packets_lost = 3;
+  double loss_pct = 4;
+  double jitter_ms = 5;
+  double mos = 6;
+
+  // What the jitter buffer and the AI pipeline made of it.
+  uint64 frames_concealed = 7;
+  double conceal_pct = 8;
+  uint32 turns = 9;
+  uint32 tool_calls = 10;
+  repeated string transcripts = 11;
+  repeated string replies = 12;
+
+  string trace_id = 13;
+}

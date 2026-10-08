@@ -14,7 +14,12 @@ import (
 // PacketHandler is called for every well-formed packet, after its stats have
 // been recorded. It runs on the receive loop, so it must not block: hand audio
 // off to a buffered channel and return.
-type PacketHandler func(sess *Session, pkt *pionrtp.Packet, arrival time.Time)
+//
+// src is where the packet came from. The gateway needs it to send synthesized
+// audio back: combining the observed source address with the return port the
+// client declares at call setup is what makes the return path work from behind
+// NAT, and is what SDP plus RTP does in practice.
+type PacketHandler func(sess *Session, pkt *pionrtp.Packet, src net.Addr, arrival time.Time)
 
 // Receiver reads RTP from a packet connection and demultiplexes by SSRC, keeping
 // independent statistics per stream.
@@ -63,7 +68,7 @@ func (r *Receiver) Serve(ctx context.Context) error {
 
 	buf := make([]byte, MaxPacketSize)
 	for {
-		n, _, err := r.conn.ReadFrom(buf)
+		n, src, err := r.conn.ReadFrom(buf)
 		// Stamp the arrival time before any parsing, so processing cost does not
 		// leak into the jitter measurement.
 		arrival := time.Now()
@@ -95,7 +100,7 @@ func (r *Receiver) Serve(ctx context.Context) error {
 			payload := make([]byte, len(pkt.Payload))
 			copy(payload, pkt.Payload)
 			pkt.Payload = payload
-			h(sess, pkt, arrival)
+			h(sess, pkt, src, arrival)
 		}
 	}
 }

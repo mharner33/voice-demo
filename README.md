@@ -20,6 +20,7 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 3 | Adaptive jitter buffer | done |
 | 4 | Provider interfaces + mocks + pipeline | done |
 | 5 | Datadog instrumentation | done |
+| — | gRPC control plane (call setup/teardown) | done |
 | 6 | LLM in the loop (agent + tool spans) | next |
 | 7 | Real Google STT/TTS | |
 | 8 | Load generator, demo script, dashboard | |
@@ -39,10 +40,10 @@ Build:
 make build
 ```
 
-Start the gateway:
+Start the gateway, which serves both the control plane and the media port:
 
 ```bash
-./bin/voicegw -addr 127.0.0.1:5004 -report-interval 2s
+./bin/voicegw -addr 127.0.0.1:5004 -grpc-addr 127.0.0.1:50051
 ```
 
 Jitter buffer flags: `-jbuf-target` (prebuffer depth in 20 ms frames, default 3),
@@ -53,15 +54,29 @@ Provider fault flags: `-provider-profile` (use `provider-degraded` to add STT an
 latency), plus `-stt-latency`, `-stt-error-rate`, `-llm-latency`, `-llm-error-rate`,
 `-tts-latency` to override individual knobs.
 
-Send a clean call, then a degraded one:
+Place a call. The client negotiates over the control plane, so it learns the media port
+rather than assuming one, and it receives the agent's spoken reply:
 
 ```bash
-./bin/voicectl send -to 127.0.0.1:5004 -duration 5s -profile clean
+./bin/voicectl send -duration 5s -profile lossy-wan -save-reply reply.wav
 ```
 
-```bash
-./bin/voicectl send -to 127.0.0.1:5004 -duration 5s -profile lossy-wan
+The client prints both sides' accounting:
+
 ```
+call c-623c122c-1
+  sender:   offered=250 sent=242 dropped=8
+  gateway:  received=242 expected=250 lost=8 (3.20%) jitter=0.3ms mos=2.71
+  loss reconciles exactly: the gateway measured all 8 dropped packets
+  buffer:   concealed=8 (3.20%)
+  agent:    turns=3 tools=2
+    0. heard: "hello I'm calling about my account balance"
+       said:  "I've pulled up your account. Account 4729 belongs to Dana Okafor, ..."
+  reply:    1070 frames of audio received
+            saved 4.00s of reply audio to reply.wav
+```
+
+`reply.wav` is the agent's reply as audio — the one artifact here you can just listen to.
 
 The gateway reports what the network did, what the jitter buffer did about it, and what
 the AI pipeline made of the result:
@@ -139,6 +154,40 @@ Override individual knobs on top of a profile:
 ```
 
 Fixing `-seed` makes a run reproducible, which is what the loss-accounting tests rely on.
+
+## Why there is a control plane
+
+The gateway accepts calls over gRPC mirroring SIP's INVITE/BYE semantics. It is not a SIP
+stack, and the signaling protocol is not the point — but four measurements are impossible
+without signaling of some kind:
+
+**Packet loss at the edges of a stream.** Loss is reconstructed from gaps between sequence
+numbers that arrived, so loss at either end leaves no evidence: nothing later reveals a
+trailing gap, and a dropped *first* packet makes the receiver silently start counting one
+packet in. `EndCall` carries both ends of the range the sender emitted. Real endpoints
+learn the same thing from RTCP. The call log reports `sequence_range_known` so a reader can
+tell an exact figure from a lower bound.
+
+**Knowing when a call ended.** Without a teardown message the end has to be inferred from
+silence, so the playout loop keeps emitting concealment for its whole hangover window. With
+`EndCall` that drops to zero, which is why the jitter buffer's conceal rate and the
+pipeline's `concealed_in_pct` now agree exactly instead of differing by the hangover.
+
+**The return media path.** The gateway synthesizes audio but has nowhere to send it until
+the caller says where to listen. The declared port is paired with the source address the
+RTP actually arrived from, which is what makes it work from behind NAT.
+
+**The client's network profile.** Nothing in an RTP stream says how it was degraded.
+
+Calls that skip signaling still work — RTP from an unknown SSRC creates a call tagged
+`signaled=false`, with no trailing-loss accounting and no reply audio. That keeps the
+contrast demonstrable:
+
+```bash
+./bin/voicectl send -to 127.0.0.1:5004 -no-signaling -duration 5s -loss-pct 10
+```
+
+Pass `-require-signaling` to the gateway to reject unsignaled media instead.
 
 ## Datadog
 
@@ -231,19 +280,26 @@ providers live behind `-tags=integration` and run via `make test-integration`.
 These are consequences of how RTP and streaming recognition work, not bugs, and all of them
 will show up in a demo:
 
-**Trailing loss is invisible.** A receiver reconstructs loss from sequence-number gaps, so
-it cannot detect packets lost at the very end of a stream — it never saw the sequence
-numbers that would reveal the gap. In the run above the sender dropped 8 packets but the
-receiver measured 6, because 2 of the drops were in the tail. Real endpoints close this gap
-with RTCP; this demo will close it with the phase-5 control plane's end-of-call message.
+**Loss at the edges of a stream is invisible without signaling.** A receiver reconstructs
+loss from gaps between sequence numbers that arrived, so it cannot see loss at either end —
+and the leading case is the easy one to miss: a dropped first packet makes the receiver
+anchor on the second and start counting a packet in. The control plane's `EndCall` carries
+both ends of the range, which makes the figure exact; `sequence_range_known` in the call log
+says whether it is. A call sent with `-no-signaling` still has the blind spot, which is the
+point of keeping that mode.
 
-**The jitter buffer's conceal rate includes a playout hangover.** When a stream goes quiet
-the playout loop keeps filling slots for 200 ms before idling, because it cannot distinguish
-"the far end paused" from "packets are missing". Those 10 frames count as concealed, so the
-`jbuf` conceal rate sits a few points above the true loss. The pipeline's `concealed_in` is
-*not* affected: starved filler is deliberately never forwarded to the recognizer, which is
-why the two numbers differ (8.39% versus 5.0% in the output above). Phase 5's end-of-call
-control message removes the ambiguity.
+**The playout hangover only applies to unsignaled calls now.** When a stream goes quiet
+without a teardown message, the playout loop keeps filling slots for 200 ms before idling,
+because it cannot distinguish "the far end paused" from "packets are missing". A signaled
+call ends exactly on `EndCall`, so it emits no trailing concealment at all — which is why
+the `jbuf` conceal rate and the pipeline's `concealed_in_pct` agree for signaled calls and
+differ for unsignaled ones.
+
+**The return audio stream is not paced.** The gateway writes synthesized frames as fast as
+the pipeline produces them rather than at one frame per 20 ms, so the *return* stream's
+jitter figure reads around 20 ms regardless of conditions — arrival spacing near zero
+against timestamps advancing 20 ms. It does not affect the saved WAV. A production gateway
+would pace it.
 
 **`provider_profile` is the gateway's profile, not the client's.** The network profile —
 loss, jitter, reordering — is chosen by `voicectl`, and nothing in an RTP stream says how a
@@ -279,5 +335,6 @@ Use the default 20 ms pacing whenever you care about the jitter number.
   explicitly experimental, so confining it to one package means an API break — or a
   workaround for an SDK bug — is a one-file fix. That paid for itself immediately: see the
   `llmobs.WithError(nil)` panic in [docs/plan.md §7](docs/plan.md) finding 18.
-- **Synthesized audio is not yet sent back to the caller.** The pipeline produces it and
-  counts it, but establishing the return media path needs the control plane.
+- **Signaling is a thin gRPC plane, not SIP.** `internal/control` owns the protocol;
+  `cmd/voicegw` implements the handler. Swapping in real SIP would mean replacing one
+  package, because the media path and the instrumentation know nothing about it.

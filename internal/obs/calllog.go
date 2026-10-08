@@ -42,9 +42,20 @@ type CallRecord struct {
 	CallID    string    `json:"call_id"`
 	SSRC      string    `json:"ssrc,omitempty"`
 	Codec     string    `json:"codec,omitempty"`
-	// Profile is the gateway's provider-impairment profile. The client's
-	// network profile is not knowable from the stream; see CallTags.
+	// Profile is the gateway's provider-impairment profile.
 	Profile string `json:"provider_profile,omitempty"`
+
+	// From, To and NetworkProfile come from the control plane. They are empty
+	// for an unsignaled call, which is itself informative.
+	From           string `json:"from,omitempty"`
+	To             string `json:"to,omitempty"`
+	NetworkProfile string `json:"network_profile,omitempty"`
+
+	// Signaled records whether the call was set up through the control plane.
+	// An unsignaled call cannot report trailing loss or receive audio back.
+	Signaled bool `json:"signaled"`
+	// EndReason is how the call ended: bye, idle-timeout, shutdown.
+	EndReason string `json:"end_reason,omitempty"`
 
 	// Network, as measured from what arrived.
 	PacketsRx   uint64  `json:"packets_rx"`
@@ -55,6 +66,19 @@ type CallRecord struct {
 	JitterMs    float64 `json:"jitter_ms"`
 	MOS         float64 `json:"mos"`
 	DurationMs  int64   `json:"duration_ms"`
+
+	// PacketsExpected is the sequence range the receiver could account for.
+	PacketsExpected uint64 `json:"packets_expected"`
+	// SequenceRangeKnown reports whether PacketsLost is exact. Without both
+	// ends of the sender's sequence range, delivered by the control plane at
+	// teardown, loss at the edges of the stream is invisible and the figure is
+	// a lower bound.
+	SequenceRangeKnown bool `json:"sequence_range_known"`
+
+	// The sender's own account, for reconciliation against what was measured.
+	SenderFramesOffered  uint64 `json:"sender_frames_offered,omitempty"`
+	SenderPacketsSent    uint64 `json:"sender_packets_sent,omitempty"`
+	SenderPacketsDropped uint64 `json:"sender_packets_dropped,omitempty"`
 
 	// Jitter buffer.
 	Played        uint64  `json:"frames_played"`
@@ -76,6 +100,9 @@ type CallRecord struct {
 	ConcealedInPct float64      `json:"concealed_in_pct"`
 	FramesOut      int          `json:"frames_out"`
 	DroppedFrames  uint64       `json:"pipeline_dropped"`
+	// FramesReturned counts synthesized frames actually sent back to the
+	// caller, which is zero unless the call signaled a return port.
+	FramesReturned uint64 `json:"frames_returned"`
 
 	// Providers, so a log search can separate mock runs from real ones.
 	STTProvider string `json:"stt_provider,omitempty"`

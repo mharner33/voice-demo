@@ -138,7 +138,7 @@ func TestLoopbackCleanDeliversEveryPacketIntact(t *testing.T) {
 			// computed as a signed 16-bit delta so the wrap is handled.
 			var mu sync.Mutex
 			got := make(map[int][]byte)
-			lb.recv.OnPacket(func(_ *Session, pkt *pionrtp.Packet, _ time.Time) {
+			lb.recv.OnPacket(func(_ *Session, pkt *pionrtp.Packet, _ net.Addr, _ time.Time) {
 				mu.Lock()
 				defer mu.Unlock()
 				got[int(int16(pkt.SequenceNumber-tc.startSeq))] = pkt.Payload
@@ -209,14 +209,21 @@ func TestLoopbackCleanDeliversEveryPacketIntact(t *testing.T) {
 	}
 }
 
-// TestLoopbackMeasuredLossMatchesInjectedLoss is the phase-2 acceptance test over
-// a real socket: the receiver, working only from sequence gaps, must arrive at
-// exactly the number of packets the sender knows it dropped.
+// TestLoopbackMeasuredLossMatchesInjectedLoss is the phase-2 acceptance test
+// over a real socket: the receiver, working only from sequence gaps plus the
+// sender's declared range, must arrive at exactly the number of packets the
+// sender knows it dropped.
+//
+// This originally padded the stream with guaranteed-delivered sentinel frames
+// so the tail of the sequence range would be observable. The control plane
+// removed the need: NoteSequenceRange declares both ends directly, which is
+// also what the gateway does on EndCall. Asserting against the real mechanism
+// is better than asserting against a workaround for its absence.
 func TestLoopbackMeasuredLossMatchesInjectedLoss(t *testing.T) {
 	const (
-		frames    = 400
-		lossPct   = 5.0
-		sentinels = 3
+		frames   = 400
+		lossPct  = 5.0
+		startSeq = 9000
 	)
 
 	lb := newLoopback(t)
@@ -226,29 +233,11 @@ func TestLoopbackMeasuredLossMatchesInjectedLoss(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sender, err := NewSender(lb.sendConn, codec.PCMU, 0x2222, imp)
-	if err != nil {
-		t.Fatal(err)
-	}
+	sender := NewSenderAt(lb.sendConn, codec.PCMU, 0x2222, imp, startSeq, 0)
 
 	if err := sender.Stream(context.Background(), payloads, testPaceInterval); err != nil {
 		t.Fatalf("Stream: %v", err)
 	}
-
-	// Loss of the final packets is undetectable without RTCP — the receiver
-	// cannot know a sequence number it never saw. Send a few guaranteed frames
-	// so the top of the sequence range is observable, which is what a real
-	// endpoint's RTCP BYE accomplishes.
-	if err := imp.SetNetwork(chaos.Network{}); err != nil {
-		t.Fatal(err)
-	}
-	tail, _ := toneFrames(t, codec.PCMU, sentinels)
-	for _, f := range tail {
-		if err := sender.Send(f); err != nil {
-			t.Fatalf("sending sentinel: %v", err)
-		}
-	}
-
 	sender.Drain()
 	lb.settle()
 
@@ -257,33 +246,55 @@ func TestLoopbackMeasuredLossMatchesInjectedLoss(t *testing.T) {
 	if !ok {
 		t.Fatal("receiver never saw the stream")
 	}
-	st := sess.Stats()
 
-	total := uint64(frames + sentinels)
-	if st.Expected != total {
-		t.Errorf("Expected = %d, want %d", st.Expected, total)
+	// Before the range is declared, loss at the edges of the stream is
+	// invisible, so the measurement is a lower bound.
+	beforeLost := sess.Stats().Lost
+	if beforeLost > ss.Dropped {
+		t.Errorf("measured %d lost before the range was declared, which exceeds "+
+			"the %d actually dropped", beforeLost, ss.Dropped)
+	}
+
+	// The sender declares what it emitted, exactly as voicectl does at teardown.
+	first, last, haveRange := sender.SeqRange()
+	if !haveRange {
+		t.Fatal("the sender reports no sequence range after streaming")
+	}
+	if first != startSeq {
+		t.Errorf("first sequence = %d, want %d", first, startSeq)
+	}
+	if want := uint16(startSeq + frames - 1); last != want {
+		t.Errorf("last sequence = %d, want %d", last, want)
+	}
+	sess.NoteSequenceRange(first, last)
+
+	st := sess.Stats()
+	if st.Expected != frames {
+		t.Errorf("Expected = %d, want %d", st.Expected, frames)
 	}
 
 	// The assertion this whole phase exists for.
 	if st.Lost != ss.Dropped {
 		t.Errorf("receiver measured %d lost but sender dropped %d", st.Lost, ss.Dropped)
 	}
-	if st.Received != total-ss.Dropped {
-		t.Errorf("Received = %d, want %d", st.Received, total-ss.Dropped)
+	if st.Received != uint64(frames)-ss.Dropped {
+		t.Errorf("Received = %d, want %d", st.Received, uint64(frames)-ss.Dropped)
+	}
+	if !st.SequenceRangeKnown {
+		t.Error("SequenceRangeKnown = false after the range was declared")
 	}
 	if ss.WriteErrors != 0 {
 		t.Errorf("sender had %d write errors — the socket, not the model, lost packets",
 			ss.WriteErrors)
 	}
 
-	// Sanity-check the injected rate landed near the target.
-	gotPct := float64(ss.Dropped) / float64(total) * 100
+	gotPct := float64(ss.Dropped) / float64(frames) * 100
 	if gotPct < lossPct/2 || gotPct > lossPct*2 {
 		t.Errorf("injected %.2f%% loss, configured %.1f%%", gotPct, lossPct)
 	}
-	t.Logf("injected %d/%d dropped (%.2f%%); receiver independently measured "+
-		"%d lost (%.2f%%), jitter %.2f ms, MOS %.2f",
-		ss.Dropped, total, gotPct, st.Lost, st.LossPct, st.JitterMs, st.MOS())
+	t.Logf("injected %d/%d dropped (%.2f%%); receiver measured %d from gaps alone, "+
+		"then exactly %d once the range was declared (jitter %.2f ms, MOS %.2f)",
+		ss.Dropped, frames, gotPct, beforeLost, st.Lost, st.JitterMs, st.MOS())
 }
 
 // TestLoopbackDuplicatesAreDetected confirms duplicate suppression works on the

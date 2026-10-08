@@ -182,7 +182,9 @@ env) so conditions can be flipped mid-demo while a dashboard is on screen.
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0 through 5 are complete.** See
+**Progress: phases 0 through 5 are complete, plus the control plane** (which was
+originally deferred to Appendix A as "real SIP signaling" but turned out to be load-bearing
+for four separate measurement problems — see findings 25-28). See
 [§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
 including corrections to assumptions recorded in this plan.
 
@@ -521,13 +523,59 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     degraded. Renamed to `provider_profile`. The network profile becomes taggable once the
     control plane carries it at call setup — a fourth thing waiting on that message.
 
+25. **The loss blind spot is symmetric, and the design only fixed half of it.** Trailing
+    loss was the known problem: a receiver cannot see a gap after the last packet that
+    arrived. The leading case is identical and easy to miss — a receiver whose *first*
+    packet was dropped anchors its sequence base on the second one and silently starts
+    counting a packet in. `NoteFinalSequence` fixed only the tail.
+
+    This was caught empirically, not by reasoning: running the real client against the
+    real gateway across fifteen seeds, two of them under-counted by exactly one packet with
+    `expected=99` on a 100-frame stream. The fix is `NoteSequenceRange(first, final)`, and
+    `EndCall` now rejects a half-range outright — accepting one end would leave the other
+    edge uncounted while reporting the figure as exact, which is worse than not fixing it.
+    A test now shows 20 dropped packets of which only 9 are countable from the stream alone.
+
+26. **A latent bug lived in the same arithmetic.** The expected range was anchored on the
+    first packet to *arrive*, not the lowest sequence number seen. With reordering at the
+    very start of a stream — packet 5 arriving before packet 0 — `Expected` undercounted
+    and could in principle fall *below* `Received`, which is nonsense. The session now
+    tracks a minimum as well as a maximum extended sequence.
+
+27. **EndCall removes the hangover entirely, which makes two numbers agree.** With an
+    explicit teardown the playout loop stops exactly when the caller stopped, so no
+    trailing concealment is emitted at all: `underruns` went from about 10 per call to 0.
+    The visible consequence is that the jitter buffer's conceal rate and the pipeline's
+    `concealed_in_pct` are now *identical* (6.53% and 6.53% on the verification run),
+    where before they differed (8.39% versus 5.0%) purely because of hangover filler. The
+    hangover bound remains for unsignaled calls and mid-call gaps, where the end still has
+    to be inferred from silence.
+
+28. **The return media path needs the observed source address, not a declared one.** The
+    caller declares a port at setup; the gateway pairs it with the address the RTP actually
+    came from. That is what SDP plus RTP does in practice and what makes the path work from
+    behind NAT. `voicectl -save-reply` writes the agent's spoken reply to a WAV, which is
+    the first artifact in this project a person can simply listen to.
+
+29. **Unsignaled calls still work, deliberately.** RTP from an SSRC that never called
+    StartCall creates a call anyway, tagged `signaled=false`, with no trailing-loss
+    accounting and no return audio. Keeping that path means every test and demo built
+    before the control plane existed still runs, and it makes the contrast demonstrable:
+    `voicectl send -no-signaling` is the before picture. `-require-signaling` on the
+    gateway turns it off.
+
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5
 should send jitter as a DogStatsD **distribution** and let the agent aggregate percentiles.
 
 ## Appendix A — Deferred: real SIP signaling
 
-Out of scope per decision 3, recorded in case the audience later cares about signaling:
+**Partly built.** A gRPC control plane mirroring INVITE/BYE now exists in
+`internal/control`, because four measurement problems turned out to be unsolvable without
+signaling of some kind (findings 25-28). What remains deferred is *SIP specifically*:
+
+Out of scope per decision 3, recorded in case the audience later cares about the protocol
+itself rather than the capability:
 
 - `emiago/sipgo` UAS: handle INVITE/ACK/BYE, parse SDP, negotiate PCMU, bind an RTP port
 - SIPp as external traffic generator using `play_pcap_audio` for media

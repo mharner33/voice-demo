@@ -164,6 +164,23 @@ func (s *Sender) Close() error {
 	return nil
 }
 
+// SeqRange returns the first and last sequence numbers this sender built,
+// including any the impairment layer dropped. The third return is false before
+// anything has been sent.
+//
+// This is what the sender hands over at teardown so the receiver can account
+// for loss at the edges of the stream. Both ends are needed: packets lost after
+// the last one that arrived leave no evidence, and neither do packets lost
+// before the first one, which instead make the receiver start counting one
+// packet in.
+func (s *Sender) SeqRange() (first, last uint16, ok bool) {
+	if s.framesOffered.Load() == 0 {
+		return 0, 0, false
+	}
+	// NextSeq is the number the *next* packet would carry.
+	return s.pktz.StartSeq(), s.pktz.NextSeq() - 1, true
+}
+
 // Stats snapshots the sender's counters.
 func (s *Sender) Stats() SenderStats {
 	return SenderStats{

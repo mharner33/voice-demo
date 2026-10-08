@@ -26,6 +26,7 @@ const MaxPacketSize = 1500
 type Packetizer struct {
 	ssrc        uint32
 	payloadType uint8
+	startSeq    uint16
 	seq         uint16
 	timestamp   uint32
 	samples     uint32 // samples per frame, the timestamp increment
@@ -52,6 +53,7 @@ func NewPacketizerAt(ssrc uint32, c codec.Codec, startSeq uint16, startTS uint32
 	return &Packetizer{
 		ssrc:        ssrc,
 		payloadType: uint8(c.PayloadType()),
+		startSeq:    startSeq,
 		seq:         startSeq,
 		timestamp:   startTS,
 		samples:     codec.SamplesPerFrame,
@@ -85,6 +87,9 @@ func (p *Packetizer) SSRC() uint32 { return p.ssrc }
 
 // NextSeq returns the sequence number the next packet will carry.
 func (p *Packetizer) NextSeq() uint16 { return p.seq }
+
+// StartSeq returns the sequence number the stream began at.
+func (p *Packetizer) StartSeq() uint16 { return p.startSeq }
 
 // Marshal serializes a packet for the wire.
 func Marshal(pkt *pionrtp.Packet) ([]byte, error) { return pkt.Marshal() }

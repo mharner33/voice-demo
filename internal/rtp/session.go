@@ -43,6 +43,16 @@ type Stats struct {
 	Duration time.Duration
 	// PayloadBytes totals the audio payload received.
 	PayloadBytes uint64
+
+	// SequenceRangeKnown reports whether the sender declared both ends of the
+	// sequence range it emitted. When false, Lost is a *lower bound*.
+	//
+	// The blind spot is symmetric. A receiver reconstructs loss from gaps
+	// between sequence numbers that arrived, so it cannot see loss at either
+	// end of the stream: there is no later packet whose number reveals a
+	// trailing gap, and no earlier packet to anchor a leading one. The control
+	// plane supplies both ends at teardown.
+	SequenceRangeKnown bool
 }
 
 // Session tracks one RTP stream, identified by SSRC. Safe for concurrent use:
@@ -55,10 +65,14 @@ type Session struct {
 	started bool
 
 	// Sequence accounting. The extended sequence space starts at 2^31 so a
-	// stream beginning near a wrap boundary cannot underflow uint32.
-	baseExt    uint32
+	// stream beginning near a wrap boundary cannot underflow uint32 — and so
+	// that a packet arriving *earlier* than the first one seen, whether through
+	// reordering or because the sender declared its true first sequence, can
+	// lower the range without going negative.
+	minExt     uint32
+	minExtSeq  uint16 // the 16-bit sequence corresponding to minExt
 	maxExt     uint32
-	maxExtSeq  uint16 // the 16-bit sequence number corresponding to maxExt
+	maxExtSeq  uint16 // the 16-bit sequence corresponding to maxExt
 	received   uint64
 	duplicates uint64
 	reordered  uint64
@@ -73,6 +87,12 @@ type Session struct {
 
 	firstArrival time.Time
 	lastArrival  time.Time
+
+	// firstSeqKnown and finalSeqKnown record that the sender declared each end
+	// of its sequence range, which is the only way loss at the edges of the
+	// stream becomes visible.
+	firstSeqKnown bool
+	finalSeqKnown bool
 
 	seen seenSet
 }
@@ -95,14 +115,15 @@ func (s *Session) Observe(pkt *pionrtp.Packet, arrival time.Time) {
 
 	if !s.started {
 		s.started = true
-		s.baseExt = 1 << 31
-		s.maxExt = s.baseExt
+		s.minExt = 1 << 31
+		s.minExtSeq = seq
+		s.maxExt = s.minExt
 		s.maxExtSeq = seq
 		s.firstArrival = arrival
 		s.lastArrival = arrival
 		s.received = 1
 		s.payload += uint64(len(pkt.Payload))
-		s.seen.add(s.baseExt)
+		s.seen.add(s.minExt)
 		s.noteTimestampLocked(pkt.Timestamp, arrival)
 		return
 	}
@@ -125,6 +146,13 @@ func (s *Session) Observe(pkt *pionrtp.Packet, arrival time.Time) {
 		s.maxExtSeq = seq
 	} else {
 		s.reordered++
+		// A packet earlier than anything seen so far lowers the range.
+		// Without this, Expected would omit it and could even fall below
+		// Received when the stream's opening packets arrive out of order.
+		if ext < s.minExt {
+			s.minExt = ext
+			s.minExtSeq = seq
+		}
 	}
 
 	s.seen.add(ext)
@@ -168,6 +196,42 @@ func (s *Session) noteTimestampLocked(rtpTS uint32, arrival time.Time) {
 	s.lastTSTime = arrival
 }
 
+// NoteSequenceRange records the first and last sequence numbers the sender
+// emitted, including any packets it dropped itself.
+//
+// This is what closes the loss blind spot, and it has to cover *both* ends.
+// Loss is reconstructed from gaps between sequence numbers that arrived, so
+// packets lost at either edge of the stream leave no evidence: nothing later
+// reveals a trailing gap, and nothing earlier anchors a leading one. A receiver
+// whose first packet was dropped silently starts counting one packet in, which
+// is exactly as wrong as missing the tail. Real endpoints learn the same range
+// from RTCP.
+//
+// A declared range narrower than what actually arrived is ignored, since there
+// is nothing to extend. If no packet ever arrived there is no anchor at all, so
+// such a call is left reporting nothing received: the sender's own count is the
+// only available account of it.
+func (s *Session) NoteSequenceRange(first, final uint16) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if !s.started {
+		return
+	}
+	s.firstSeqKnown = true
+	s.finalSeqKnown = true
+
+	// Signed 16-bit differences, so both are correct across the sequence wrap.
+	if delta := int32(int16(s.minExtSeq - first)); delta > 0 {
+		s.minExt = uint32(int64(s.minExt) - int64(delta))
+		s.minExtSeq = first
+	}
+	if delta := int32(int16(final - s.maxExtSeq)); delta > 0 {
+		s.maxExt = uint32(int64(s.maxExt) + int64(delta))
+		s.maxExtSeq = final
+	}
+}
+
 // Stats snapshots the current measurements.
 func (s *Session) Stats() Stats {
 	s.mu.Lock()
@@ -181,11 +245,13 @@ func (s *Session) Stats() Stats {
 		JitterMs:     s.jitter / s.clockRate * 1000,
 		MaxJitterMs:  s.maxJitter / s.clockRate * 1000,
 		PayloadBytes: s.payload,
+
+		SequenceRangeKnown: s.firstSeqKnown && s.finalSeqKnown,
 	}
 	if !s.started {
 		return st
 	}
-	st.Expected = uint64(s.maxExt-s.baseExt) + 1
+	st.Expected = uint64(s.maxExt-s.minExt) + 1
 	if st.Expected > st.Received {
 		st.Lost = st.Expected - st.Received
 	}

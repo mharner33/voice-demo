@@ -128,7 +128,7 @@ func newEgress(t *testing.T, c codec.Codec) *egress {
 	e.startSeq = startSeq
 	e.sender = rtp.NewSenderAt(sendConn, c, 0xE6E55001, nil, startSeq, 0)
 
-	e.recv.OnPacket(func(_ *rtp.Session, pkt *pionrtp.Packet, _ time.Time) {
+	e.recv.OnPacket(func(_ *rtp.Session, pkt *pionrtp.Packet, _ net.Addr, _ time.Time) {
 		e.mu.Lock()
 		defer e.mu.Unlock()
 		e.payloads[pkt.SequenceNumber] = pkt.Payload
