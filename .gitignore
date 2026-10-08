@@ -1,0 +1,21 @@
+# build output
+/bin/
+*.test
+*.out
+
+# credentials — never commit
+.env
+*.json.key
+gcp-sa.json
+/deploy/secrets/
+
+# local artifacts
+/calllogs/
+*.wav.out
+coverage.*
+
+# editor / OS
+.DS_Store
+*.swp
+.idea/
+.vscode/

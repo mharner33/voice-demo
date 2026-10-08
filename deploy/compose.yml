@@ -1,0 +1,72 @@
+# podman compose -f deploy/compose.yml up -d --build
+#
+# NOTE on macOS: RTP/UDP from the host crosses the podman VM boundary. The UDP port
+# mapping below is required, and host->container UDP can still be finicky. If the client
+# can't reach the gateway, run voicectl inside this network instead:
+#   podman run --rm --network voice-demo_voicenet ... voicectl
+name: voice-demo
+
+services:
+  voicegw:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    container_name: voicegw
+    ports:
+      - "${VOICE_RTP_PORT:-5004}:5004/udp"   # RTP media
+      - "${VOICE_GRPC_PORT:-50051}:50051"    # gRPC control plane
+      - "${VOICE_HTTP_PORT:-8080}:8080"      # /chaos, /healthz, /metrics
+    environment:
+      DD_ENV: ${DD_ENV:-demo}
+      DD_SERVICE: ${DD_SERVICE:-voicegw}
+      DD_VERSION: ${DD_VERSION:-0.1.0}
+      DD_AGENT_HOST: datadog-agent
+      DD_TRACE_AGENT_PORT: "8126"
+      DD_DOGSTATSD_PORT: "8125"
+      DD_LLMOBS_ENABLED: ${DD_LLMOBS_ENABLED:-true}
+      DD_LLMOBS_ML_APP: ${DD_LLMOBS_ML_APP:-voice-demo}
+      VOICE_STT_PROVIDER: ${VOICE_STT_PROVIDER:-mock}
+      VOICE_LLM_PROVIDER: ${VOICE_LLM_PROVIDER:-mock}
+      VOICE_TTS_PROVIDER: ${VOICE_TTS_PROVIDER:-mock}
+      GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
+      GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    volumes:
+      # drop a GCP service-account JSON here for phase 7; dir is gitignored
+      - ./secrets:/run/secrets:ro,z
+    labels:
+      com.datadoghq.ad.logs: '[{"source":"go","service":"voicegw"}]'
+    depends_on:
+      - datadog-agent
+    networks: [voicenet]
+
+  datadog-agent:
+    image: gcr.io/datadoghq/agent:7
+    container_name: datadog-agent
+    environment:
+      DD_API_KEY: ${DD_API_KEY:?DD_API_KEY is required — copy .env.example to .env}
+      DD_SITE: ${DD_SITE:-datadoghq.com}
+      DD_ENV: ${DD_ENV:-demo}
+      DD_HOSTNAME: voice-demo-local
+      # APM
+      DD_APM_ENABLED: "true"
+      DD_APM_NON_LOCAL_TRAFFIC: "true"
+      # DogStatsD
+      DD_USE_DOGSTATSD: "true"
+      DD_DOGSTATSD_NON_LOCAL_TRAFFIC: "true"
+      # logs
+      DD_LOGS_ENABLED: "true"
+      DD_LOGS_CONFIG_CONTAINER_COLLECT_ALL: "true"
+      DD_CONTAINER_EXCLUDE: "name:datadog-agent"
+    ports:
+      - "8126:8126"   # APM
+      - "8125:8125/udp"
+    volumes:
+      - /var/run/podman/podman.sock:/var/run/docker.sock:ro,z
+      - /proc/:/host/proc/:ro
+      - /sys/fs/cgroup/:/host/sys/fs/cgroup:ro
+    networks: [voicenet]
+
+networks:
+  voicenet:
+    driver: bridge
