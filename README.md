@@ -17,8 +17,8 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 0 | Scaffold, Makefile, compose, toolchain | done |
 | 1 | G.711 codec, WAV I/O, resampling | done |
 | 2 | RTP transport, loss/jitter accounting, chaos injection | done |
-| 3 | Jitter buffer | next |
-| 4 | Provider interfaces + mocks | |
+| 3 | Adaptive jitter buffer | done |
+| 4 | Provider interfaces + mocks | next |
 | 5 | Datadog instrumentation | |
 | 6 | LLM in the loop (agent + tool spans) | |
 | 7 | Real Google STT/TTS | |
@@ -42,6 +42,10 @@ Start the gateway:
 ./bin/voicegw -addr 127.0.0.1:5004 -report-interval 2s
 ```
 
+Jitter buffer flags: `-jbuf-target` (prebuffer depth in 20 ms frames, default 3),
+`-jbuf-max` (hard cap, default 25), `-jbuf-adaptive`, and `-conceal` (`repeat`, `silence`,
+or `noise`).
+
 Send a clean call, then a degraded one:
 
 ```bash
@@ -52,12 +56,39 @@ Send a clean call, then a degraded one:
 ./bin/voicectl send -to 127.0.0.1:5004 -duration 5s -profile lossy-wan
 ```
 
-The gateway reports per-stream measurements derived only from what arrived:
+The gateway reports per-stream network measurements, derived only from what arrived,
+alongside what the jitter buffer did with them:
 
 ```
-[live] ssrc=0x020ffeb0 recv=250 expected=250 lost=0 (0.00%) dup=0 reorder=0 jitter=0.42ms mos=4.41
-[live] ssrc=0xf16e6ff0 recv=231 expected=244 lost=13 (5.33%) dup=0 reorder=58 jitter=74.10ms mos=1.94
+[ended] ssrc=0xa7087cbb | net: recv=184 expected=200 lost=16 (8.00%) dup=0 reorder=62
+        jitter=26.1ms mos=1.64 dur=4.041s | jbuf: played=210 concealed=26 (12.38%)
+        late=0 evicted=0 depth=0/200ms peak=12
 ```
+
+### Seeing the latency/loss trade-off
+
+This is the clearest single demonstration of why buffer depth matters. Run the same
+impaired stream through a shallow and a deep buffer:
+
+```bash
+./bin/voicegw -addr 127.0.0.1:5004 -jbuf-target 2 -idle-timeout 1s
+```
+
+```bash
+./bin/voicectl send -to 127.0.0.1:5004 -duration 4s -profile lossy-wan -seed 7
+```
+
+Then repeat with `-jbuf-target 10`. On an identical stream (200 packets, 16 genuinely lost
+by the network, 63 reordered):
+
+| Buffer depth | Late-dropped | Concealed | Self-inflicted loss |
+|---|---|---|---|
+| 2 frames (40 ms) | 4 | 29 (13.9%) | 4 packets that had arrived |
+| 10 frames (200 ms) | 0 | 26 (12.4%) | none |
+
+The deep buffer's 26 concealed slots are exactly the 16 packets the network lost plus the
+10-frame playout hangover — it threw nothing away itself. The shallow buffer discarded 4
+packets that had already arrived, trading audio quality for 160 ms less latency.
 
 List the impairment profiles:
 
@@ -91,15 +122,21 @@ make help
 `make test` is fully offline — no cloud credentials, no API spend. Tests that hit real
 providers live behind `-tags=integration` and run via `make test-integration`.
 
-## Two measurement artifacts worth knowing
+## Three measurement artifacts worth knowing
 
-Both are real properties of RTP, not bugs, and both will show up in a demo:
+All three are consequences of how RTP works, not bugs, and all three will show up in a demo:
 
 **Trailing loss is invisible.** A receiver reconstructs loss from sequence-number gaps, so
 it cannot detect packets lost at the very end of a stream — it never saw the sequence
 numbers that would reveal the gap. In the run above the sender dropped 8 packets but the
 receiver measured 6, because 2 of the drops were in the tail. Real endpoints close this gap
 with RTCP; this demo will close it with the phase-5 control plane's end-of-call message.
+
+**The conceal rate includes a playout hangover.** When a stream goes quiet the playout
+loop keeps filling slots for 200 ms before idling, because it cannot distinguish "the far
+end paused" from "packets are missing". Those 10 frames count as concealed, so a short call
+reports a conceal rate a few points above its true loss. Phase 5's end-of-call control
+message removes the ambiguity.
 
 **`-pace` below 20 ms inflates jitter.** The flag compresses a call into less wall-clock
 time by sending frames faster while RTP timestamps still advance at the true 20 ms rate.

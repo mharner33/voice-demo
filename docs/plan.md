@@ -182,9 +182,9 @@ env) so conditions can be flipped mid-demo while a dashboard is on screen.
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0, 1, and 2 are complete.** See
-[§7 Findings from phases 0-2](#7-findings-from-phases-0-2) for what the implementation
-taught us, including two corrections to assumptions recorded in this plan.
+**Progress: phases 0 through 3 are complete.** See
+[§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
+including corrections to assumptions recorded in this plan.
 
 ### Phase 0 — Scaffold & toolchain
 
@@ -215,14 +215,19 @@ round-trip with an SNR assertion; fuzz the decoder on random bytes.
 with 5% scripted loss and fixed jitter, assert the server's computed loss % and jitter land
 within tolerance. This is what proves the dashboard numbers aren't lying.
 
-### Phase 3 — Jitter buffer
+### Phase 3 — Jitter buffer (done)
 
-- Ring buffer keyed on RTP timestamp; configurable target/max depth; late-packet drop;
-  underrun → comfort noise; reorder repair
+- Map keyed on extended RTP timestamp; configurable target/max depth; prebuffering;
+  late-packet drop; duplicate rejection; overflow eviction with playout advance; hole
+  concealment (repeat with fade / silence / comfort noise); optional adaptive depth
+- `voicegw` runs a per-stream buffer with a 20 ms playout loop
 
 **Test:** scripted packet sequences (in-order, reordered, duplicated, gapped,
-late-beyond-depth) asserting correctly ordered PCM output and expected drop/underrun
-counts. Driven by a **fake clock** so there is no timing flake.
+late-beyond-depth, overflowing, across the timestamp wrap) asserting correctly ordered
+PCM output and expected drop/conceal counts, plus an end-to-end pass over the real
+packetizer and impairment model.
+
+**No fake clock was needed.** A pull-driven design made it unnecessary — see finding 8.
 
 ### Phase 4 — Provider interfaces + mock implementations
 
@@ -317,10 +322,10 @@ UI can be added later if the customer session calls for it.
 | Flaky timing-dependent tests | Fake clock in the jitter buffer; tolerance-based assertions elsewhere |
 | Google streaming API 5-minute stream limit | Cap synthetic call duration; document the constraint |
 
-## 7. Findings from phases 0-2
+## 7. Findings from the implementation
 
-What the implementation changed about the plan. Recorded because two of these corrected
-assumptions written above, and the sixth affects how the demo should be run.
+What the implementation changed about the plan. Findings 1-7 are from phases 0-2;
+8-11 are from phase 3.
 
 1. **"ITU reference vectors" was the wrong test.** The actual ITU vector files are not
    public, so phase 1 instead asserts the structural properties every conformant G.711
@@ -369,6 +374,47 @@ assumptions written above, and the sixth affects how the demo should be run.
 7. **Sender and receiver agree exactly.** The phase-2 acceptance test over real UDP
    injected 28 drops and the receiver independently measured 28 lost, working only from
    sequence gaps. Verified stable across repeated runs.
+
+8. **The fake clock was unnecessary — a pull-driven buffer is better.** The plan called
+   for driving the jitter buffer with a fake clock. Instead the buffer is pull-driven: the
+   consumer calls `Pop` once per packetization interval, exactly as an audio device's
+   callback does, which makes the pull cadence itself the clock. Every decision — is this
+   packet late, is this slot a hole, is the buffer over its latency budget — became a
+   function of logical playout position rather than wall-clock time. The result is fully
+   deterministic with no clock abstraction to build or inject.
+
+9. **Extended-timestamp arithmetic broke in three places, all found by tests.** Emitted
+   frames carried truncated timestamps, because `uint32` of a 2^40-based extended value
+   discards exactly the wrong bits (2^40 mod 2^32 is 0). The frame-grid check underflowed
+   for any packet behind playout, because unsigned subtraction wraps and 2^64 is not
+   divisible by 160, so late packets were misreported as off-grid. And the grid anchor had
+   to be *fixed* for the whole call rather than following the advancing playout position.
+   Extended timestamps need a stored origin for both the wire value and the grid.
+
+10. **A playout loop must bound its concealment hangover.** The first `voicegw` playout
+    loop kept popping after the audio ended, emitting roughly a second of filler and
+    driving the reported conceal rate to 31% against a true 8% network loss. The loop now
+    goes idle after 10 consecutive starved slots (200 ms, comfortably more than the
+    lossy-wan profile's ~4-frame bursts). The remaining 10-frame tail still inflates the
+    end-of-call conceal rate slightly; **phase 5's end-of-call control message removes it**,
+    the same message finding 5 already requires for the loss count.
+
+11. **The latency/loss trade-off is measurable and reconciles exactly.** On an identical
+    impaired stream, a 40 ms buffer discarded 4 packets as late and concealed 29 slots,
+    while a 200 ms buffer discarded none and concealed 26 — exactly the 16 packets the
+    network actually lost plus the 10-frame hangover, i.e. zero self-inflicted loss. This
+    comparison is the phase-8 demo's clearest single illustration of why buffer depth
+    matters.
+
+12. **A random starting sequence number needs wrap-safe test code.** The phase-2 loopback
+    test reassembled audio by numerically sorting raw `uint16` sequence numbers. Because
+    `NewSender` picks a random start per RFC 3550, roughly 0.4% of runs began within 250 of
+    65535, wrapped mid-stream, and sorted the post-wrap frames first — rotating the audio
+    and failing. It surfaced once during phase 3 and would otherwise have looked like a
+    mystery flake. The test now pins the starting sequence and orders frames by signed
+    delta, with one case that always wraps. Worth remembering for the phase-8 load
+    generator: anything that reassembles a stream must use signed-delta arithmetic, never a
+    numeric sort.
 
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5

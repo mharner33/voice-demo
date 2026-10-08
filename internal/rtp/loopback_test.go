@@ -114,90 +114,98 @@ func toneFrames(t *testing.T, c codec.Codec, n int) ([][]byte, []int16) {
 // TestLoopbackCleanDeliversEveryPacketIntact is the control: over real UDP with
 // no impairment, every packet must arrive and the audio must survive the trip
 // byte for byte.
+//
+// The starting sequence number is pinned rather than left to NewSender's random
+// choice, and one case starts close enough to 65535 that the sequence wraps
+// mid-stream. Reassembly therefore has to order frames by signed delta from a
+// known origin; numerically sorting raw uint16 sequence numbers would place the
+// post-wrap frames first and rotate the audio.
 func TestLoopbackCleanDeliversEveryPacketIntact(t *testing.T) {
 	const frames = 250
 
-	lb := newLoopback(t)
-	payloads, wantPCM := toneFrames(t, codec.PCMU, frames)
+	for _, tc := range []struct {
+		name     string
+		startSeq uint16
+	}{
+		{"mid-range sequence", 1000},
+		{"sequence wraps mid-stream", 65535 - frames/2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			lb := newLoopback(t)
+			payloads, wantPCM := toneFrames(t, codec.PCMU, frames)
 
-	// Collect payloads keyed by sequence number so the audio can be
-	// reassembled regardless of arrival order.
-	var mu sync.Mutex
-	got := make(map[uint16][]byte)
-	lb.recv.OnPacket(func(_ *Session, pkt *pionrtp.Packet, _ time.Time) {
-		mu.Lock()
-		defer mu.Unlock()
-		got[pkt.SequenceNumber] = pkt.Payload
-	})
+			// Key payloads by their offset from the known starting sequence,
+			// computed as a signed 16-bit delta so the wrap is handled.
+			var mu sync.Mutex
+			got := make(map[int][]byte)
+			lb.recv.OnPacket(func(_ *Session, pkt *pionrtp.Packet, _ time.Time) {
+				mu.Lock()
+				defer mu.Unlock()
+				got[int(int16(pkt.SequenceNumber-tc.startSeq))] = pkt.Payload
+			})
 
-	sender, err := NewSender(lb.sendConn, codec.PCMU, 0x1111, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := sender.Stream(context.Background(), payloads, testPaceInterval); err != nil {
-		t.Fatalf("Stream: %v", err)
-	}
-	sender.Drain()
-	lb.settle()
+			sender := NewSenderAt(lb.sendConn, codec.PCMU, 0x1111, nil, tc.startSeq, 0)
+			if err := sender.Stream(context.Background(), payloads, testPaceInterval); err != nil {
+				t.Fatalf("Stream: %v", err)
+			}
+			sender.Drain()
+			lb.settle()
 
-	ss := sender.Stats()
-	if ss.PacketsSent != frames {
-		t.Errorf("sender sent %d packets, want %d", ss.PacketsSent, frames)
-	}
-	if ss.WriteErrors != 0 {
-		t.Errorf("sender had %d write errors", ss.WriteErrors)
-	}
+			ss := sender.Stats()
+			if ss.PacketsSent != frames {
+				t.Errorf("sender sent %d packets, want %d", ss.PacketsSent, frames)
+			}
+			if ss.WriteErrors != 0 {
+				t.Errorf("sender had %d write errors", ss.WriteErrors)
+			}
 
-	sess, ok := lb.recv.Session(sender.SSRC())
-	if !ok {
-		t.Fatal("receiver never saw the stream")
-	}
-	st := sess.Stats()
-	if st.Received != frames {
-		t.Errorf("receiver got %d packets, want %d (loopback UDP should not drop)",
-			st.Received, frames)
-	}
-	if st.Lost != 0 {
-		t.Errorf("Lost = %d, want 0", st.Lost)
-	}
-	if st.Duplicated != 0 {
-		t.Errorf("Duplicated = %d, want 0", st.Duplicated)
-	}
-	if lb.recv.Malformed() != 0 {
-		t.Errorf("Malformed = %d, want 0", lb.recv.Malformed())
-	}
+			sess, ok := lb.recv.Session(sender.SSRC())
+			if !ok {
+				t.Fatal("receiver never saw the stream")
+			}
+			st := sess.Stats()
+			if st.Received != frames {
+				t.Errorf("receiver got %d packets, want %d (loopback UDP should not drop)",
+					st.Received, frames)
+			}
+			if st.Lost != 0 {
+				t.Errorf("Lost = %d, want 0", st.Lost)
+			}
+			if st.Duplicated != 0 {
+				t.Errorf("Duplicated = %d, want 0", st.Duplicated)
+			}
+			if lb.recv.Malformed() != 0 {
+				t.Errorf("Malformed = %d, want 0", lb.recv.Malformed())
+			}
 
-	// Reassemble in sequence order and confirm the audio is unchanged.
-	mu.Lock()
-	defer mu.Unlock()
-	if len(got) != frames {
-		t.Fatalf("collected %d distinct payloads, want %d", len(got), frames)
-	}
-	var decoded []int16
-	seqs := make([]uint16, 0, len(got))
-	for s := range got {
-		seqs = append(seqs, s)
-	}
-	// Sequence numbers are contiguous here, so sorting recovers send order.
-	for i := 1; i < len(seqs); i++ {
-		for j := i; j > 0 && seqs[j] < seqs[j-1]; j-- {
-			seqs[j], seqs[j-1] = seqs[j-1], seqs[j]
-		}
-	}
-	for _, s := range seqs {
-		decoded = append(decoded, codec.PCMU.Decode(got[s])...)
-	}
-	if len(decoded) != len(wantPCM) {
-		t.Fatalf("reassembled %d samples, want %d", len(decoded), len(wantPCM))
-	}
-	// The round trip through G.711 is lossy, but the *same* lossy transform was
-	// applied on the way in, so the comparison is exact.
-	wantRoundTripped := codec.PCMU.Decode(codec.PCMU.Encode(wantPCM))
-	for i := range decoded {
-		if decoded[i] != wantRoundTripped[i] {
-			t.Fatalf("sample %d changed in transit: got %d, want %d",
-				i, decoded[i], wantRoundTripped[i])
-		}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(got) != frames {
+				t.Fatalf("collected %d distinct payloads, want %d", len(got), frames)
+			}
+
+			var decoded []int16
+			for i := 0; i < frames; i++ {
+				payload, ok := got[i]
+				if !ok {
+					t.Fatalf("no payload at offset %d from the starting sequence", i)
+				}
+				decoded = append(decoded, codec.PCMU.Decode(payload)...)
+			}
+			if len(decoded) != len(wantPCM) {
+				t.Fatalf("reassembled %d samples, want %d", len(decoded), len(wantPCM))
+			}
+
+			// The round trip through G.711 is lossy, but the *same* lossy
+			// transform was applied on the way in, so this comparison is exact.
+			wantRoundTripped := codec.PCMU.Decode(codec.PCMU.Encode(wantPCM))
+			for i := range decoded {
+				if decoded[i] != wantRoundTripped[i] {
+					t.Fatalf("sample %d changed in transit: got %d, want %d",
+						i, decoded[i], wantRoundTripped[i])
+				}
+			}
+		})
 	}
 }
 
