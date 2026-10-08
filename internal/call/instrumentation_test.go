@@ -24,6 +24,15 @@ import (
 // instrumentedRun drives one call through the pipeline with telemetry on and
 // returns the captured LLM Obs spans.
 func instrumentedRun(t *testing.T, frames int, concealedEvery int) ([]testtracer.LLMObsSpan, Result) {
+	spans, res, _ := instrumentedRunWithTracer(t, frames, concealedEvery)
+	return spans, res
+}
+
+// instrumentedRunWithTracer is the same thing, also handing back the test
+// tracer so a test can read the evaluation metrics it submitted.
+func instrumentedRunWithTracer(t *testing.T, frames int, concealedEvery int) (
+	[]testtracer.LLMObsSpan, Result, *testtracer.TestTracer,
+) {
 	t.Helper()
 
 	tt := testtracer.Start(t, testtracer.WithTracerStartOpts(
@@ -89,7 +98,7 @@ func instrumentedRun(t *testing.T, frames int, concealedEvery int) ([]testtracer
 	tracer.Flush()
 
 	// workflow + stt + agent + 2 model rounds + tool + tts = 7
-	return tt.WaitForLLMObsSpans(t, 7), res
+	return tt.WaitForLLMObsSpans(t, 7), res, tt
 }
 
 func findSpan(t *testing.T, spans []testtracer.LLMObsSpan, name string) testtracer.LLMObsSpan {

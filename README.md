@@ -21,16 +21,19 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 4 | Provider interfaces + mocks + pipeline | done |
 | 5 | Datadog instrumentation | done |
 | — | gRPC control plane (call setup/teardown) | done |
-| 6 | LLM in the loop (agent + tool spans) | next |
-| 7 | Real Google STT/TTS | |
+| 6 | LLM in the loop (real agent, tool definitions, cost, evaluations) | done |
+| 7 | Real Google STT/TTS | next |
 | 8 | Load generator, demo script, dashboard | |
 | 9 | Demo polish | |
 
 The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
 agent reply with a tool call, synthesized audio out — reported as APM traces, Agent
-Observability spans, DogStatsD metrics and a correlated call log. Every provider is a
-deterministic mock, so `make test` needs no credentials and spends nothing. Telemetry is
-off by default, so the demo also runs with no Datadog agent at all.
+Observability spans with token counts, cost and per-call evaluations, DogStatsD metrics and
+a correlated call log.
+
+Speech recognition and synthesis are still deterministic mocks, so `make test` needs no
+credentials and spends nothing. The agent is a mock too by default; `-real-llm` swaps in
+Claude. Telemetry is off by default, so the demo also runs with no Datadog agent at all.
 
 ## Quick start
 
@@ -189,6 +192,48 @@ contrast demonstrable:
 
 Pass `-require-signaling` to the gateway to reject unsignaled media instead.
 
+## Running a real agent
+
+The agent is a scripted mock by default. `-real-llm` swaps in Claude through the official
+Go SDK:
+
+```bash
+./bin/voicegw -addr 127.0.0.1:5004 -real-llm -dd
+```
+
+Credentials come from the environment — `ANTHROPIC_API_KEY`, or a profile from `ant auth
+login`, which the SDK picks up on its own. There is deliberately no `-api-key` flag, so a
+key never lands in this program's command line, its logs, or anyone's shell history.
+
+`-llm-model` and `-llm-effort` tune the call. The defaults are `claude-opus-5` at `low`
+effort, because on a phone line the caller sits in silence for every token spent thinking.
+Thinking is left *on* rather than disabled even so: disabling it risks the model writing a
+tool call into its spoken text instead of actually calling the tool, which would have it
+read out a balance it never looked up (plan finding 35).
+
+The gateway logs which agent is answering at startup, and says when a model has no
+published price so you know why the cost metrics are empty:
+
+```
+agent: anthropic claude-opus-5 at low effort
+agent: mock (scripted; pass -real-llm for the Anthropic API)
+```
+
+**Why the mock is the default.** Beyond cost and credentials, the scripted agent is what
+makes the transport story reproducible: it returns the same reply for the same transcript,
+so a difference in the dashboards between two runs is a difference in the *network*. The
+demo's central claim is only legible against a fixed agent.
+
+Tests that call the live API are behind a build tag and skip without credentials:
+
+```bash
+make test-integration
+```
+
+They check what only a real model can: that it keeps replies short enough to speak, calls
+the tool instead of inventing a balance, and asks for a repeat when handed a transcript
+that packet loss has damaged.
+
 ## Datadog
 
 Telemetry is **off by default**. Turn it on with `-dd` (or `VOICE_DD_ENABLED=true`):
@@ -228,9 +273,25 @@ workflow  voice_call              session_id = call_id
 ├── agent voice_agent
 │   ├── llm  agent.reply          one span per model round trip
 │   │                             input_tokens, output_tokens, total_tokens
+│   │                             input_cost, output_cost, tool_definitions
 │   └── tool lookup_account
 └── llm   tts.synthesize          time_to_first_token = first audio byte
 ```
+
+Plus three **evaluations** per call, joined to the workflow span, which is what populates
+the Evaluations view:
+
+| Evaluation | Kind | What it is |
+|---|---|---|
+| `transcript_confidence` | score | the recognizer's mean confidence across the call |
+| `audio_quality` | categorical | `clean` / `degraded` / `poor`, by concealed fraction |
+| `replied_every_turn` | boolean | false if any turn produced no reply — silence on the line |
+
+These are computed from pipeline data rather than by an LLM judge, on purpose. The point of
+the demo is that network damage shows up as AI quality damage, and `transcript_confidence`
+is the number that moves: a clean call scores 0.95, the same call with every fourth frame
+concealed scores 0.71 and is labeled `poor`. A judge would mostly measure the judge. A test
+asserts the gap, so if it ever closes the demo's claim has quietly stopped being true.
 
 Transport metrics belong in APM; AI metrics belong in Agent Observability. They share one
 APM trace ID, which is what lets you pivot between them — and what the call log records so

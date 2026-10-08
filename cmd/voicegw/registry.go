@@ -46,6 +46,20 @@ func newGateway(jbCfg jbuf.Config, p providers, tel telemetry, mediaPort int, re
 	}
 }
 
+// release tears a call down and lets the providers drop whatever they were
+// holding for it.
+//
+// The agent is the one that cares: a real model keeps the conversation history
+// so the caller can refer back to what they said, and that history is only
+// safe to discard once the call is genuinely over. Waiting for it to age out
+// would hold a finished call's transcript in memory for no reason.
+func (g *gateway) release(c *activeCall, reason string) {
+	c.finish(reason)
+	if g.providers.forget != nil {
+		g.providers.forget(c.id)
+	}
+}
+
 // StartCall establishes a call before any media arrives, the INVITE analogue.
 func (g *gateway) StartCall(ctx context.Context, req control.StartRequest) (control.StartResult, error) {
 	g.mu.Lock()
@@ -79,7 +93,7 @@ func (g *gateway) StartCall(ctx context.Context, req control.StartRequest) (cont
 	// have won the race while this one was building its pipeline.
 	if existing, ok := g.bySSRC[req.SSRC]; ok {
 		g.mu.Unlock()
-		c.finish("superseded")
+		g.release(c, "superseded")
 		return control.StartResult{}, fmt.Errorf("%w: ssrc %#08x is call %s",
 			control.ErrCallExists, req.SSRC, existing.id)
 	}
@@ -129,7 +143,7 @@ func (g *gateway) EndCall(ctx context.Context, callID string, report control.Sen
 	if reason == "" {
 		reason = "bye"
 	}
-	c.finish(reason)
+	g.release(c, reason)
 
 	ns := c.stats()
 	jb := c.jb.Stats()
@@ -186,7 +200,7 @@ func (g *gateway) onPacket(sess *rtp.Session, ssrc uint32, src net.Addr, arrival
 		g.mu.Lock()
 		if existing, ok := g.bySSRC[ssrc]; ok {
 			g.mu.Unlock()
-			c.finish("superseded")
+			g.release(c, "superseded")
 			return existing
 		}
 		g.bySSRC[ssrc] = c
@@ -241,7 +255,7 @@ func (g *gateway) reapIdle(now time.Time, timeout time.Duration) {
 			// distinguishing: its loss figures are a lower bound.
 			reason = "idle-timeout-no-bye"
 		}
-		c.finish(reason)
+		g.release(c, reason)
 		report("ended", c)
 	}
 }
@@ -269,7 +283,7 @@ func (g *gateway) drain(reason string) []*activeCall {
 	g.mu.Unlock()
 
 	for _, c := range out {
-		c.finish(reason)
+		g.release(c, reason)
 	}
 	return out
 }

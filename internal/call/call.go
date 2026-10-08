@@ -177,6 +177,37 @@ func (r Result) ConcealedFraction() float64 {
 	return float64(r.ConcealedFramesIn) / float64(r.FramesIn)
 }
 
+// MeanConfidence is the recognizer's average confidence across the call's
+// turns. It is the headline AI-quality figure for the demo because it is the
+// one that degrades when the *network* does.
+func (r Result) MeanConfidence() float64 {
+	if len(r.Turns) == 0 {
+		return 0
+	}
+	var sum float64
+	for _, t := range r.Turns {
+		sum += t.Confidence
+	}
+	return sum / float64(len(r.Turns))
+}
+
+// RepliedEveryTurn reports whether every turn produced something to say. A call
+// with no turns at all did not fail to reply, so it counts as true.
+func (r Result) RepliedEveryTurn() bool {
+	for _, t := range r.Turns {
+		if t.Reply == "" {
+			return false
+		}
+	}
+	return true
+}
+
+// CostUSD is the model spend for the call, from the provider's own price list.
+func (r Result) CostUSD() float64 {
+	in, out := r.LLMInfo.Pricing.Cost(r.InputTokens, r.OutputTokens)
+	return in + out
+}
+
 // Transcripts returns the finalized transcript of each turn.
 func (r Result) Transcripts() []string {
 	out := make([]string, 0, len(r.Turns))
@@ -374,8 +405,11 @@ func (s *Session) Run(ctx context.Context, audio <-chan stt.Audio) (Result, erro
 			"errors":           res.Errors,
 			"concealed_pct":    res.ConcealedFraction() * 100,
 			"audio_in_seconds": res.AudioInDuration().Seconds(),
+			"cost_usd":         res.CostUSD(),
 		},
 	)
+
+	s.recordEvaluations(wf, res)
 
 	if err := ctx.Err(); err != nil && !errors.Is(err, context.Canceled) {
 		wf.Finish(err)
@@ -383,6 +417,30 @@ func (s *Session) Run(ctx context.Context, audio <-chan stt.Audio) (Result, erro
 	}
 	wf.Finish(nil)
 	return res, nil
+}
+
+// recordEvaluations submits the call's quality judgements against the workflow
+// span, which is what populates the Agent Observability Evaluations view.
+//
+// All three are derived from data the pipeline already has rather than from a
+// second model grading the first. That is deliberate: an LLM judge would be a
+// more impressive demo of evaluations and a much worse demo of *this* system,
+// because the figure that makes the argument here is one that moves with packet
+// loss. A judge would mostly measure the judge.
+func (s *Session) recordEvaluations(wf *obs.Span, res Result) {
+	tags := map[string]string{
+		"codec":    string(s.cfg.Tags.Codec),
+		"provider": res.LLMInfo.Provider,
+		"model":    res.LLMInfo.Model,
+	}
+
+	// Submitted even when there were no turns: a call that transcribed nothing
+	// is exactly the outcome worth seeing in the Evaluations view, and omitting
+	// it would quietly bias the series towards calls that went well.
+	s.cfg.Obs.EvalScore(wf, obs.EvalTranscriptConfidence, res.MeanConfidence(), tags)
+	s.cfg.Obs.EvalCategorical(wf, obs.EvalAudioQuality,
+		obs.AudioQualityBucket(res.ConcealedFraction()), tags)
+	s.cfg.Obs.EvalBool(wf, obs.EvalReplied, res.RepliedEveryTurn(), tags)
 }
 
 // recordSTT emits one Agent Observability span per recognized utterance.
@@ -623,6 +681,11 @@ func (s *Session) recordLLMRound(ctx context.Context, info llm.Info,
 		return
 	}
 
+	// The tools offered are recorded on the span, not merely the ones called.
+	// Without them a turn where the model decided it did not need a tool is
+	// indistinguishable from a turn where no tool was available.
+	span.SetToolDefinitions(toolDefinitions(req.Tools))
+
 	input := []obs.Message{{Role: "user", Content: req.Transcript}}
 	for _, tr := range req.ToolResults {
 		content := tr.Content
@@ -640,8 +703,15 @@ func (s *Session) recordLLMRound(ctx context.Context, info llm.Info,
 		})
 	}
 
+	inCost, outCost := info.Pricing.Cost(reply.InputTokens, reply.OutputTokens)
+
 	span.LLMIO(input, []obs.Message{out},
-		obs.Metrics{InputTokens: reply.InputTokens, OutputTokens: reply.OutputTokens},
+		obs.Metrics{
+			InputTokens:   reply.InputTokens,
+			OutputTokens:  reply.OutputTokens,
+			InputCostUSD:  inCost,
+			OutputCostUSD: outCost,
+		},
 		map[string]any{
 			"tools_offered":     len(req.Tools),
 			"tools_requested":   len(reply.ToolCalls),
@@ -649,6 +719,24 @@ func (s *Session) recordLLMRound(ctx context.Context, info llm.Info,
 		},
 	)
 	span.Finish(callErr)
+}
+
+// toolDefinitions converts the agent's tool list to the observability layer's
+// form. The two types are separate so that internal/llm does not have to know
+// about spans, which is the same reason obs.Message exists.
+func toolDefinitions(tools []llm.Tool) []obs.ToolDefinition {
+	if len(tools) == 0 {
+		return nil
+	}
+	out := make([]obs.ToolDefinition, 0, len(tools))
+	for _, t := range tools {
+		out = append(out, obs.ToolDefinition{
+			Name:        t.Name,
+			Description: t.Description,
+			Schema:      t.Schema,
+		})
+	}
+	return out
 }
 
 // runTool executes one tool call inside its own Agent Observability span.

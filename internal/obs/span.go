@@ -26,6 +26,18 @@ type ToolCall struct {
 	Args []byte
 }
 
+// ToolDefinition describes a capability offered to a model. Recording the
+// definitions on the LLM span — not just the calls that resulted — is what makes
+// a turn where the model declined to use a tool interpretable: without them,
+// "no tool call" and "no tool offered" look identical in the trace.
+type ToolDefinition struct {
+	Name        string
+	Description string
+	Version     string
+	// Schema is the JSON Schema for the tool's arguments.
+	Schema []byte
+}
+
 // Metrics are the numeric attributes attached to an LLM span.
 //
 // These are span attributes, not platform metrics. Datadog derives platform
@@ -35,6 +47,16 @@ type ToolCall struct {
 type Metrics struct {
 	InputTokens  int
 	OutputTokens int
+
+	// InputCostUSD and OutputCostUSD are the dollar cost of this call. The SDK
+	// has no constant for either: input_cost and output_cost are custom metric
+	// keys that Datadog recognizes, so they are spelled literally below.
+	//
+	// Cost is computed here rather than derived from tokens in a dashboard
+	// because only the provider knows its own price list, and a mock provider
+	// legitimately costs nothing.
+	InputCostUSD  float64
+	OutputCostUSD float64
 
 	// TimeToFirstToken is the delay before the first output appeared. The SDK
 	// expects seconds, so the conversion happens here rather than at every
@@ -64,6 +86,35 @@ func (m Metrics) toLLMObs() map[string]float64 {
 	}
 	if m.BillableCharacters > 0 {
 		out[llmobs.MetricKeyBillableCharacterCount] = float64(m.BillableCharacters)
+	}
+	if m.InputCostUSD > 0 {
+		out[metricKeyInputCost] = m.InputCostUSD
+	}
+	if m.OutputCostUSD > 0 {
+		out[metricKeyOutputCost] = m.OutputCostUSD
+	}
+	return out
+}
+
+// Cost metric keys. These have no SDK constants — Datadog accepts them as
+// custom metrics on an LLM span and renders them in the cost views.
+const (
+	metricKeyInputCost  = "input_cost"
+	metricKeyOutputCost = "output_cost"
+)
+
+func toToolDefinitions(defs []ToolDefinition) []llmobs.ToolDefinition {
+	if len(defs) == 0 {
+		return nil
+	}
+	out := make([]llmobs.ToolDefinition, 0, len(defs))
+	for _, d := range defs {
+		out = append(out, llmobs.ToolDefinition{
+			Name:        d.Name,
+			Description: d.Description,
+			ToolVersion: d.Version,
+			Schema:      d.Schema,
+		})
 	}
 	return out
 }
@@ -101,7 +152,8 @@ type Span struct {
 	textIO func(input, output string, opts ...llmobs.AnnotateOption)
 	llmIO  func(input, output []llmobs.LLMMessage, opts ...llmobs.AnnotateOption)
 
-	tags map[string]string
+	tags     map[string]string
+	toolDefs []ToolDefinition
 }
 
 // StartAPM opens a plain APM span. The transport stages use this: packet loss
@@ -233,7 +285,20 @@ func (s *Span) annotateOpts(metadata map[string]any, m Metrics) []llmobs.Annotat
 	if len(s.tags) > 0 {
 		opts = append(opts, llmobs.WithAnnotatedTags(s.tags))
 	}
+	if defs := toToolDefinitions(s.toolDefs); len(defs) > 0 {
+		opts = append(opts, llmobs.WithAnnotatedToolDefinitions(defs))
+	}
 	return opts
+}
+
+// SetToolDefinitions records the tools offered on this span. They are applied
+// on the next annotation, which is why this is called before LLMIO rather than
+// after.
+func (s *Span) SetToolDefinitions(defs []ToolDefinition) {
+	if s == nil {
+		return
+	}
+	s.toolDefs = defs
 }
 
 // SetTags attaches tags that will be applied on the next annotation, and to

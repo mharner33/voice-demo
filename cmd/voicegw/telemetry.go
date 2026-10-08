@@ -188,6 +188,9 @@ func (c *activeCall) writeCallLog(reason string, ns rtp.Stats, jb jbuf.Stats,
 		rec.OutputTokens = res.OutputTokens
 		rec.ConcealedInPct = res.ConcealedFraction() * 100
 		rec.FramesOut = res.FramesOut
+		rec.CostUSD = res.CostUSD()
+		rec.MeanConfidence = res.MeanConfidence()
+		rec.AudioQuality = obs.AudioQualityBucket(res.ConcealedFraction())
 		if res.HavePartial {
 			rec.FirstPartialMs = res.FirstPartialAt.Milliseconds()
 		}

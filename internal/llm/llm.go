@@ -73,10 +73,34 @@ func (r Reply) NeedsTools() bool { return len(r.ToolCalls) > 0 }
 // TotalTokens is the sum reported on the span.
 func (r Reply) TotalTokens() int { return r.InputTokens + r.OutputTokens }
 
+// Pricing is a model's published price list, in US dollars per million tokens.
+//
+// It belongs to the provider rather than to a dashboard because only the
+// provider knows what it charges, and because a mock provider genuinely costs
+// nothing — a zero price list is the correct answer, not a missing one.
+type Pricing struct {
+	InputPerMTok  float64
+	OutputPerMTok float64
+}
+
+// Cost converts token counts to dollars. A zero price list yields zero cost,
+// which is what keeps the mock from reporting a fictional spend.
+func (p Pricing) Cost(inputTokens, outputTokens int) (input, output float64) {
+	const perMillion = 1_000_000
+	return float64(inputTokens) * p.InputPerMTok / perMillion,
+		float64(outputTokens) * p.OutputPerMTok / perMillion
+}
+
+// Free reports whether this provider charges nothing.
+func (p Pricing) Free() bool { return p.InputPerMTok == 0 && p.OutputPerMTok == 0 }
+
 // Info identifies the implementation, for span annotation.
 type Info struct {
 	Provider string // "mock", "anthropic"
 	Model    string // "scripted", "claude-..."
+
+	// Pricing lets the pipeline report per-call cost on the LLM span.
+	Pricing Pricing
 }
 
 // Agent turns a transcript into a reply, possibly by way of tool calls.

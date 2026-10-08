@@ -60,6 +60,13 @@ func main() {
 		ttsLatency = flag.Duration("tts-latency", -1, "override TTS added latency")
 		seed       = flag.Int64("fault-seed", 1, "seed for provider fault injection")
 
+		realLLM = flag.Bool("real-llm", envBool("VOICE_REAL_LLM", false),
+			"use the Anthropic API for the agent turn instead of the scripted mock")
+		llmModel = flag.String("llm-model", envOr("VOICE_LLM_MODEL", llm.DefaultAnthropicModel),
+			"model to use with -real-llm")
+		llmEffort = flag.String("llm-effort", envOr("VOICE_LLM_EFFORT", "low"),
+			"reasoning effort for -real-llm: low, medium, high, xhigh, or max")
+
 		ddEnabled   = flag.Bool("dd", envBool("VOICE_DD_ENABLED", false), "report traces, metrics and logs to Datadog")
 		ddLLMObs    = flag.Bool("dd-llmobs", envBool("DD_LLMOBS_ENABLED", true), "report Agent Observability spans")
 		ddAgentless = flag.Bool("dd-agentless", envBool("DD_LLMOBS_AGENTLESS_ENABLED", false), "submit LLM Obs data without an agent (needs DD_API_KEY)")
@@ -112,7 +119,11 @@ func main() {
 		pv.TTSExtraLatencyMs = float64(ttsLatency.Milliseconds())
 	}
 
-	p, err := buildProviders(pv, *seed)
+	p, err := buildProviders(pv, *seed, agentConfig{
+		real:   *realLLM,
+		model:  *llmModel,
+		effort: *llmEffort,
+	})
 	if err != nil {
 		log.Fatalf("voicegw: %v", err)
 	}
@@ -202,9 +213,60 @@ type providers struct {
 	llm   llm.Agent
 	tts   tts.Synthesizer
 	tools *llm.Registry
+
+	// llmDescription is logged at startup. Which agent is answering changes
+	// what a demo costs and how it behaves, so it should never be a guess.
+	llmDescription string
+
+	// forget releases a call's state at teardown, for an agent that keeps
+	// conversation history. It is nil for the stateless mock.
+	forget func(callID string)
 }
 
-func buildProviders(pv chaos.Provider, seed int64) (providers, error) {
+// agentConfig selects the agent implementation.
+type agentConfig struct {
+	real   bool
+	model  string
+	effort string
+}
+
+// buildAgent returns the agent for this run, plus a description and a teardown
+// hook.
+//
+// The mock is the default deliberately. It keeps `make test` and an offline
+// demo working with no credentials and no spend, and it is what makes the
+// transport story reproducible: a scripted agent returns the same reply for the
+// same transcript, so a change in the dashboards is a change in the network
+// rather than a change in the model's mood.
+func buildAgent(cfg agentConfig, tools *llm.Registry) (llm.Agent, string, func(string), error) {
+	if !cfg.real {
+		agent, err := llm.NewMock(llm.MockConfig{Registry: tools})
+		if err != nil {
+			return nil, "", nil, err
+		}
+		return agent, "mock (scripted; pass -real-llm for the Anthropic API)", nil, nil
+	}
+
+	agent, err := llm.NewAnthropic(llm.AnthropicConfig{
+		Model:  cfg.model,
+		Effort: cfg.effort,
+		// The API key is deliberately not a flag. The SDK resolves credentials
+		// from the environment, which keeps a key out of this program's command
+		// line, its logs, and anyone's shell history.
+	})
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	info := agent.Info()
+	desc := fmt.Sprintf("anthropic %s at %s effort", info.Model, cfg.effort)
+	if info.Pricing.Free() {
+		desc += " (no published price for this model; cost metrics will be absent)"
+	}
+	return agent, desc, agent.Forget, nil
+}
+
+func buildProviders(pv chaos.Provider, seed int64, ac agentConfig) (providers, error) {
 	ms := func(v float64) time.Duration { return time.Duration(v) * time.Millisecond }
 
 	tools, err := llm.DefaultRegistry()
@@ -216,7 +278,7 @@ func buildProviders(pv chaos.Provider, seed int64) (providers, error) {
 	if err != nil {
 		return providers{}, err
 	}
-	agent, err := llm.NewMock(llm.MockConfig{Registry: tools})
+	agent, agentDesc, forget, err := buildAgent(ac, tools)
 	if err != nil {
 		return providers{}, err
 	}
@@ -244,7 +306,10 @@ func buildProviders(pv chaos.Provider, seed int64) (providers, error) {
 		return providers{}, err
 	}
 
-	return providers{stt: faultySTT, llm: faultyLLM, tts: faultyTTS, tools: tools}, nil
+	return providers{
+		stt: faultySTT, llm: faultyLLM, tts: faultyTTS, tools: tools,
+		llmDescription: agentDesc, forget: forget,
+	}, nil
 }
 
 type runConfig struct {
@@ -277,10 +342,12 @@ func run(cfg runConfig) error {
 	log.Printf("jitter buffer: target %d frames (%dms), max %d frames (%dms), conceal=%s, adaptive=%v",
 		cfg.jbCfg.TargetDepth, cfg.jbCfg.TargetDepth*20, cfg.jbCfg.MaxDepth,
 		cfg.jbCfg.MaxDepth*20, cfg.jbCfg.Conceal, cfg.jbCfg.Adaptive)
-	log.Printf("providers: stt=%s/%s llm=%s/%s tts=%s/%s",
+	log.Printf("providers: stt=%s/%s tts=%s/%s",
 		cfg.providers.stt.Info().Provider, cfg.providers.stt.Info().Model,
-		cfg.providers.llm.Info().Provider, cfg.providers.llm.Info().Model,
 		cfg.providers.tts.Info().Provider, cfg.providers.tts.Info().Model)
+	// The agent gets its own line because which one is answering changes what
+	// the demo costs and how reproducible it is.
+	log.Printf("agent: %s", cfg.providers.llmDescription)
 	log.Print(cfg.tel.tracer.Describe())
 	if cfg.requireSignaling {
 		log.Print("requiring StartCall before media")

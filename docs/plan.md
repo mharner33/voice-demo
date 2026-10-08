@@ -124,8 +124,12 @@ Notes:
 - `WithSessionID(callID)` groups every span of a call in the LLM Obs session view — this
   is the view to open first in a demo.
 - `span.APMTraceID()` ties LLM Obs spans back to the APM trace for the drill-down.
-- Phase 6 also submits an evaluation (`SubmitEvaluationFromSpan`) — e.g. a transcript
-  confidence score — so the Evaluations view isn't empty.
+- Each call submits three evaluations against its workflow span via
+  `SubmitEvaluationFromSpan`: `transcript_confidence` (score), `audio_quality`
+  (categorical), `replied_every_turn` (boolean). All three are derived from pipeline data,
+  not from an LLM judge, so the confidence figure moves with packet loss — see finding 34.
+- Cost rides the LLM span as the `input_cost` / `output_cost` custom metric keys, which
+  have no SDK constants (finding 33).
 
 ### DogStatsD metrics (tagged `call_id`, `codec`, `chaos_profile`)
 
@@ -278,20 +282,32 @@ runs the real pipeline against it and asserts the span kinds, the nesting, the s
 grouping, the metric keys and their units. Verified additionally against a real local agent
 (7.84.2): see finding 21.
 
-### Phase 6 — LLM in the loop (moved forward)
+### Phase 6 — LLM in the loop (done)
 
 This is what turns the demo from a pipeline into an actual voice agent, and what makes the
 Agent Observability views worth showing.
 
-- Real LLM turn: transcript → reply, with a tool definition (`lookup_account`) backed by a
-  mock implementation so the trace shows `agent` → `llm` + `tool` spans
-- `WithAnnotatedToolDefinitions`, token metrics, cost tags
-- One submitted evaluation per call so the Evaluations view is populated
-- TTS consumes the LLM reply rather than echoing the transcript
+Two of the four items shipped early, in phase 4: the `agent` → `llm` + `tool` span tree
+with token metrics, and TTS consuming the agent's reply. What phase 6 added:
 
-**Test:** integration test with mock STT/TTS and a real LLM, asserting the tool is invoked
-and the full span tree appears. Verify in Datadog that token costs, tool calls, and the
-evaluation all render.
+- **A real agent** — `internal/llm/anthropic.go`, Claude via the official Go SDK, behind
+  `-real-llm`. The mock stays the default (finding 32).
+- **`WithAnnotatedToolDefinitions`** on every model round, so a turn where the agent
+  decided it did not need a tool is distinguishable from one where no tool was offered.
+- **Cost** as `input_cost` / `output_cost` custom metrics on the LLM span, computed from a
+  per-model price list carried on `llm.Info` (finding 33).
+- **Three evaluations per call** via `SubmitEvaluationFromSpan`, joined to the workflow
+  span: `transcript_confidence` (score), `audio_quality` (categorical), and
+  `replied_every_turn` (boolean). Derived from pipeline data rather than an LLM judge,
+  deliberately (finding 34).
+
+**Test:** `internal/llm/anthropic_test.go` drives the real SDK against a local HTTP server,
+covering the request this program builds and the tool round trip with no credentials and no
+spend. `internal/call/evaluation_test.go` asserts the tool definitions, cost, and all three
+evaluations reach the capturing fake agent. `internal/llm/anthropic_integration_test.go`
+(behind `-tags=integration`) checks what only a live model can: that it keeps replies short
+enough to speak, calls the tool instead of inventing a balance, and asks for a repeat when
+handed a garbled transcript.
 
 ### Phase 7 — Real Google STT/TTS
 
@@ -563,6 +579,80 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     before the control plane existed still runs, and it makes the contrast demonstrable:
     `voicectl send -no-signaling` is the before picture. `-require-signaling` on the
     gateway turns it off.
+
+30. **Tool definitions are accepted on LLM spans only.** `WithAnnotatedToolDefinitions`
+    on a workflow or agent span is dropped with a log warning, not an error — the SDK
+    checks `spanKind` first. The agent span is the more natural home for "what this agent
+    can do", so this is worth knowing before reaching for it. They go on the per-round
+    `agent.reply` LLM span instead, which has the side benefit of showing the tool set as
+    it was on each round. `TestToolDefinitionsAreOnlyValidOnLLMSpans` pins the behavior so
+    a future SDK release that relaxes it is visible.
+
+31. **The `Agent` interface is stateless; a real model is not.** The interface takes one
+    transcript at a time, but the Messages API is given the whole conversation on every
+    request, and a turn that calls a tool *must* replay the assistant message that
+    requested it — results are matched to calls by `tool_use` ID, and a reconstructed
+    turn missing them is rejected. So the provider keeps history keyed by call ID, with
+    `Message.ToParam()` echoing each response back verbatim so thinking blocks and tool
+    IDs survive. The side benefit is a coherent agent: the caller can say "what about the
+    other one" and be understood. The gateway calls `Forget` at teardown rather than
+    waiting for the TTL to reap it.
+
+    Two bugs here were found by tests, not by inspection. The turn-boundary rule for
+    trimming history assumed tool results arrive as *consecutive* user messages; they do
+    not — the sequence is user, assistant(tool_use), user(tool_result) — so every tool
+    turn was counted as two and trimming cut in the wrong place. And the trim then kept
+    one turn too many, slicing at the oldest collected boundary instead of the
+    *maxTurns*-th newest. Both would have produced a request the API rejects, only on a
+    call long enough to trim.
+
+32. **The mock stays the default, and that is a feature.** `-real-llm` is opt-in. Beyond
+    cost and credentials, the scripted agent is what makes the transport story
+    reproducible: it returns the same reply for the same transcript, so a change in the
+    dashboards between two runs is a change in the *network*, not in the model's mood.
+    The demo's central claim — that packet loss degrades AI quality — is only legible
+    against a fixed agent.
+
+33. **Cost has no SDK constant; `input_cost` and `output_cost` are custom metric keys.**
+    Datadog recognizes them and renders them in the cost views, but a typo would be
+    invisible: the span submits fine and the view simply stays empty. `TestCostMetricsUse
+    TheExpectedKeys` pins both strings. Pricing lives on `llm.Info` so the provider owns
+    its own price list, and an unknown model reports *no* cost rather than a guessed one
+    — a missing figure is recoverable, a wrong one quietly misinforms every downstream
+    dashboard. A free provider omits the metric entirely rather than sending zero, which
+    would drag down any average taken across mock and real calls.
+
+34. **The evaluations are derived from pipeline data, not from an LLM judge.** A judge
+    would be a more impressive demo of evaluations and a much worse demo of *this* system,
+    because the figure that makes the argument here is one that moves with packet loss. A
+    judge would mostly measure the judge. `transcript_confidence` is the recognizer's own
+    mean confidence, `audio_quality` buckets the call by concealed fraction, and
+    `replied_every_turn` catches the failure the transport metrics cannot see — a turn
+    that produced silence. All three are submitted even on a call that transcribed
+    nothing, since omitting them would bias the series toward calls that went well.
+
+    `TestConcealedAudioDegradesTheEvaluation` makes the demo's claim falsifiable: clean
+    audio scores 0.950, audio with every fourth frame concealed scores 0.712 and is
+    labeled `poor`. If that test ever passes trivially, the thing the dashboards are built
+    to show has stopped happening.
+
+35. **Thinking is left on, at low effort, rather than disabled.** Disabling it would be the
+    obvious choice for a latency-critical phone call, and it has a failure mode that would
+    be both invisible here and ruinous: on this model family the model occasionally writes
+    a tool call into its *spoken text* instead of emitting a real tool call. The turn
+    "succeeds", the lookup never runs, and the caller is read a balance that was never
+    fetched. Low effort buys most of the latency saving without that risk. Relatedly,
+    `max_tokens` has to leave headroom because thinking shares the output budget with the
+    spoken text — a tight cap truncates the reply mid-sentence, which the caller hears.
+
+36. **A refusal is a successful response with no content.** `stop_reason: "refusal"`
+    arrives as HTTP 200, so code that reads `content[0]` unconditionally would hand the
+    caller silence — the one failure mode a phone line must never have. The provider
+    checks the stop reason *before* the content and speaks a handoff line instead. The
+    server-side `fallbacks` parameter was deliberately not adopted: it is beta-endpoint
+    only, which would move the whole provider onto beta param types for a risk this
+    content does not carry. Handling the refusal gracefully defends against the actual
+    failure mode. Reversible if a demo ever needs it.
 
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5

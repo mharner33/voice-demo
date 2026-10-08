@@ -96,10 +96,21 @@ type CallRecord struct {
 	PipelineErrors int          `json:"pipeline_errors"`
 	InputTokens    int          `json:"input_tokens"`
 	OutputTokens   int          `json:"output_tokens"`
-	FirstPartialMs int64        `json:"first_partial_ms,omitempty"`
-	ConcealedInPct float64      `json:"concealed_in_pct"`
-	FramesOut      int          `json:"frames_out"`
-	DroppedFrames  uint64       `json:"pipeline_dropped"`
+
+	// CostUSD is the model spend for the call. Omitted when the provider is
+	// free, so a mock run does not log a misleading zero alongside real ones.
+	CostUSD float64 `json:"cost_usd,omitempty"`
+
+	// MeanConfidence and AudioQuality are the figures submitted as the call's
+	// evaluations. They are repeated here so a log line tells the same story as
+	// the Evaluations view, which is what makes the two cross-checkable.
+	MeanConfidence float64 `json:"mean_confidence,omitempty"`
+	AudioQuality   string  `json:"audio_quality,omitempty"`
+
+	FirstPartialMs int64   `json:"first_partial_ms,omitempty"`
+	ConcealedInPct float64 `json:"concealed_in_pct"`
+	FramesOut      int     `json:"frames_out"`
+	DroppedFrames  uint64  `json:"pipeline_dropped"`
 	// FramesReturned counts synthesized frames actually sent back to the
 	// caller, which is zero unless the call signaled a return port.
 	FramesReturned uint64 `json:"frames_returned"`
