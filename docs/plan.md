@@ -182,7 +182,7 @@ env) so conditions can be flipped mid-demo while a dashboard is on screen.
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0 through 3 are complete.** See
+**Progress: phases 0 through 4 are complete.** See
 [§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
 including corrections to assumptions recorded in this plan.
 
@@ -229,7 +229,7 @@ packetizer and impairment model.
 
 **No fake clock was needed.** A pull-driven design made it unnecessary — see finding 8.
 
-### Phase 4 — Provider interfaces + mock implementations
+### Phase 4 — Provider interfaces + mock implementations (done)
 
 ```go
 type Transcriber interface {
@@ -249,9 +249,14 @@ type Synthesizer interface {
 - `mock` TTS: known PCM pattern, length proportional to text
 - Fault-injection decorators (latency, error rate) wrapping any implementation
 
-**Test:** full pipeline, zero network — WAV in → RTP → jbuf → mock STT → mock LLM → mock
-TTS → RTP out, asserting expected transcript and audio length. This becomes the CI
-regression test for every later phase.
+Delivered as `internal/stt`, `internal/llm`, `internal/tts`, `internal/faults` (the shared
+latency/error primitive) and `internal/call` (the pipeline, which also measures the timings
+phase 5 turns into spans). `voicegw` now runs the full pipeline per stream.
+
+**Test:** full pipeline, zero network — audio in → RTP → jbuf → mock STT → mock LLM (with a
+real tool call) → mock TTS → RTP out over a real socket, asserting the transcript, the tool
+result in the reply, the degraded confidence, and the egress tone frequency that identifies
+the exact reply text. This is the CI regression test for every later phase.
 
 ### Phase 5 — Datadog instrumentation
 
@@ -406,7 +411,42 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     comparison is the phase-8 demo's clearest single illustration of why buffer depth
     matters.
 
-12. **A random starting sequence number needs wrap-safe test code.** The phase-2 loopback
+12. **Mocks keyed on audio content would have been a mistake.** The plan called for the
+    mock recognizer to look up transcripts by a hash of the audio. That breaks the moment
+    loss is injected: the same call would transcribe differently clean versus lossy, and no
+    pipeline test could assert a fixed transcript. The mock is instead driven by *how much*
+    audio it has consumed — a partial every N frames, a final every M — which is
+    deterministic, independent of wall-clock time, and still produces realistic growing
+    partials. Same conclusion as finding 8: make the mock a function of logical progress,
+    not of content or of time.
+
+13. **The mocks must make loss visible in the AI layer.** A pure plumbing mock would have
+    made phases 5-8 testable but would not have demonstrated anything. The mock recognizer
+    therefore degrades its reported confidence in proportion to how much of the utterance
+    was jitter-buffer filler, and the mock synthesizer derives its tone frequency from the
+    reply text. The first makes packet loss show up as an AI-quality metric; the second
+    lets a test prove the agent's *specific* reply reached the caller as audio, rather than
+    merely that some audio was sent.
+
+14. **Never feed concealed audio to a recognizer when the buffer is empty.** The first
+    `voicegw` pipeline forwarded every popped frame, including the playout hangover's
+    trailing filler. Because that filler is entirely invented, the last utterance of every
+    call consisted only of concealment and reported **zero confidence** despite its speech
+    having been recognized correctly — and it manufactured a spurious extra turn. Mid-call
+    holes with audio queued behind them are still forwarded to keep the timeline intact,
+    but a starved buffer now pauses the stream instead. This also brought the AI-layer and
+    network-layer numbers into agreement: `concealed_in` fell from 8.4% to 5.0% against an
+    actual network loss of 5.33%. A third consequence of the hangover (see finding 10), and
+    another reason phase 5's end-of-call message matters.
+
+15. **The audio queue into the pipeline needs a drop policy, not backpressure.** A slow
+    agent turn (the provider-degraded profile adds 3 s per LLM round trip, 6 s on a
+    tool-calling turn) would block the playout loop if the queue were unbuffered. Blocking
+    is wrong: a caller's voice cannot be paused, so unbounded queueing would just become a
+    second, invisible jitter buffer. The queue is bounded at 2 s and drops with a counter
+    when full, which is reported per call.
+
+16. **A random starting sequence number needs wrap-safe test code.** The phase-2 loopback
     test reassembled audio by numerically sorting raw `uint16` sequence numbers. Because
     `NewSender` picks a random start per RFC 3550, roughly 0.4% of runs began within 250 of
     65535, wrapped mid-stream, and sorted the post-wrap frames first — rotating the audio
