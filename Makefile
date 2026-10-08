@@ -73,8 +73,18 @@ agent-status:
 	@podman exec datadog-agent agent status 2>/dev/null \
 	  | grep -A4 -E 'APM Agent|DogStatsD' || echo "agent not ready"
 
+## dashboard: upload deploy/datadog/dashboard.json (needs DD_API_KEY and DD_APP_KEY)
+dashboard:
+	@test -n "$$DD_API_KEY" || { echo "DD_API_KEY is not set"; exit 1; }
+	@test -n "$$DD_APP_KEY" || { echo "DD_APP_KEY is not set"; exit 1; }
+	curl -sS -X POST "https://api.$${DD_SITE:-datadoghq.com}/api/v1/dashboard" \
+	  -H "Content-Type: application/json" \
+	  -H "DD-API-KEY: $$DD_API_KEY" \
+	  -H "DD-APPLICATION-KEY: $$DD_APP_KEY" \
+	  -d @deploy/datadog/dashboard.json | python3 -m json.tool | head -20
+
 ## demo: scripted demo run (phase 8)
 demo:
 	@echo "not implemented until phase 8"
 
-.PHONY: help build test test-integration cover fuzz lint tidy proto up down logs agent-status demo
+.PHONY: help build test test-integration cover fuzz lint tidy proto up down logs agent-status dashboard demo

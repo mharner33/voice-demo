@@ -19,16 +19,17 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 2 | RTP transport, loss/jitter accounting, chaos injection | done |
 | 3 | Adaptive jitter buffer | done |
 | 4 | Provider interfaces + mocks + pipeline | done |
-| 5 | Datadog instrumentation | next |
-| 6 | LLM in the loop (agent + tool spans) | |
+| 5 | Datadog instrumentation | done |
+| 6 | LLM in the loop (agent + tool spans) | next |
 | 7 | Real Google STT/TTS | |
 | 8 | Load generator, demo script, dashboard | |
 | 9 | Demo polish | |
 
-Nothing is wired to Datadog yet — that is phase 5. What works today is the whole call
-path: RTP in, jitter buffer, transcript, agent reply with a tool call, synthesized audio
-out. Every provider is a deterministic mock, so `make test` needs no credentials and
-spends nothing.
+The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
+agent reply with a tool call, synthesized audio out — reported as APM traces, Agent
+Observability spans, DogStatsD metrics and a correlated call log. Every provider is a
+deterministic mock, so `make test` needs no credentials and spends nothing. Telemetry is
+off by default, so the demo also runs with no Datadog agent at all.
 
 ## Quick start
 
@@ -139,6 +140,80 @@ Override individual knobs on top of a profile:
 
 Fixing `-seed` makes a run reproducible, which is what the loss-accounting tests rely on.
 
+## Datadog
+
+Telemetry is **off by default**. Turn it on with `-dd` (or `VOICE_DD_ENABLED=true`):
+
+```bash
+./bin/voicegw -addr 127.0.0.1:5004 -dd -dd-env demo
+```
+
+Start the agent and the gateway together, then upload the dashboard:
+
+```bash
+make up
+```
+
+```bash
+make dashboard
+```
+
+`make dashboard` needs `DD_API_KEY` and `DD_APP_KEY`. The dashboard definition lives in
+[deploy/datadog/dashboard.json](deploy/datadog/dashboard.json), and a test asserts every
+metric it charts is one the code actually emits — an empty graph during a demo is
+indistinguishable from a healthy system, so the two cannot be allowed to drift.
+
+### What gets reported
+
+**One APM trace per call.** `voice.call` is the root, with backdated children
+`voice.rtp.ingest` and `voice.jitter_buffer` carrying the loss, jitter and buffer figures
+as tags. The transport stages run for the whole call rather than as a nested call stack, so
+their spans are created at the end and backdated to cover it.
+
+**Agent Observability spans** for the AI stages, grouped into one session per call:
+
+```
+workflow  voice_call              session_id = call_id
+├── llm   stt.transcribe          one per utterance, backdated to its start
+│                                 time_to_first_token, billable_character_count
+├── agent voice_agent
+│   ├── llm  agent.reply          one span per model round trip
+│   │                             input_tokens, output_tokens, total_tokens
+│   └── tool lookup_account
+└── llm   tts.synthesize          time_to_first_token = first audio byte
+```
+
+Transport metrics belong in APM; AI metrics belong in Agent Observability. They share one
+APM trace ID, which is what lets you pivot between them — and what the call log records so
+a log line jumps to its trace.
+
+**Token counts are deliberately not sent over DogStatsD.** Datadog derives
+`ml_obs.span.llm.*.tokens` from the span attributes, so emitting them again would double
+count. DogStatsD carries the transport and call-level figures, which have no Agent
+Observability equivalent.
+
+**A call log line** per call, JSON on stdout, holding the network, buffer and AI figures
+together with `dd.trace_id` and `dd.span_id`:
+
+```json
+{"event":"call.end","call_id":"c-658948e7","packets_rx":234,"packets_lost":16,
+ "loss_pct":6.4,"jitter_ms":31.4,"mos":1.86,"frames_concealed":26,"conceal_pct":10,
+ "turn_count":3,"tool_calls":2,"input_tokens":96,"output_tokens":86,
+ "first_partial_ms":621,"concealed_in_pct":6.02,
+ "turns":[{"transcript":"hello I'm calling about my account balance","confidence":0.874,
+           "reply":"I've pulled up your account. Account 4729 belongs to Dana Okafor...",
+           "tool_calls":["lookup_account"],"tool_rounds":2}],
+ "dd.trace_id":"6ac80e91000000002920ab6f7a1b6a9f","service":"voicegw","env":"demo"}
+```
+
+### If the agent is missing, the gateway refuses to start
+
+With LLM Observability enabled in agent mode and no agent reachable, `tracer.Start` fails
+and `voicegw` exits with a message naming the four remedies. That is deliberate:
+discovering mid-presentation that the dashboards are empty is worse than failing at launch.
+Run without `-dd` to skip telemetry entirely, or `-dd-llmobs=false` for APM and metrics
+only (which tolerates a missing agent).
+
 ## Make targets
 
 ```bash
@@ -170,6 +245,12 @@ the playout loop keeps filling slots for 200 ms before idling, because it cannot
 why the two numbers differ (8.39% versus 5.0% in the output above). Phase 5's end-of-call
 control message removes the ambiguity.
 
+**`provider_profile` is the gateway's profile, not the client's.** The network profile —
+loss, jitter, reordering — is chosen by `voicectl`, and nothing in an RTP stream says how a
+stream was degraded, so the gateway cannot tag it. Tagging the gateway's provider profile as
+though it were the network profile would attribute client-side impairment to the server.
+The control plane will carry the real one.
+
 **`-pace` below 20 ms inflates jitter.** The flag compresses a call into less wall-clock
 time by sending frames faster while RTP timestamps still advance at the true 20 ms rate.
 Jitter is defined as the difference between arrival spacing and timestamp spacing, so
@@ -194,5 +275,9 @@ Use the default 20 ms pacing whenever you care about the jitter number.
   `internal/llm` and `internal/tts` each expose one seam plus a mock whose output is a
   function of logical progress, never of wall-clock time or of audio content. Phases 6 and 7
   swap in the real LLM and Google STT/TTS without anything above the interfaces changing.
+- **Every Datadog SDK call lives in `internal/obs`.** The Agent Observability SDK is
+  explicitly experimental, so confining it to one package means an API break — or a
+  workaround for an SDK bug — is a one-file fix. That paid for itself immediately: see the
+  `llmobs.WithError(nil)` panic in [docs/plan.md §7](docs/plan.md) finding 18.
 - **Synthesized audio is not yet sent back to the caller.** The pipeline produces it and
-  counts it, but establishing the return media path is the control plane's job in phase 5.
+  counts it, but establishing the return media path needs the control plane.

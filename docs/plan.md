@@ -182,7 +182,7 @@ env) so conditions can be flipped mid-demo while a dashboard is on screen.
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0 through 4 are complete.** See
+**Progress: phases 0 through 5 are complete.** See
 [§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
 including corrections to assumptions recorded in this plan.
 
@@ -258,7 +258,7 @@ real tool call) → mock TTS → RTP out over a real socket, asserting the trans
 result in the reply, the degraded confidence, and the egress tone frequency that identifies
 the exact reply text. This is the CI regression test for every later phase.
 
-### Phase 5 — Datadog instrumentation
+### Phase 5 — Datadog instrumentation (done)
 
 - `internal/obs`: tracer start (`tracer.WithLLMObsEnabled()`,
   `WithLLMObsMLApp("voice-demo")`), DogStatsD client, structured logger with trace injection
@@ -266,9 +266,15 @@ the exact reply text. This is the CI regression test for every later phase.
 - LLM Obs workflow + llm/agent/tool spans around STT/LLM/TTS
 - Call-log writer
 
-**Test:** assert span names/tags/metrics with dd-trace-go's `mocktracer` in unit tests;
-run against the local agent with `DD_TRACE_DEBUG=1`. Then verify manually in Datadog: one
-trace per call, LLM Obs session grouped by `call_id`, metrics flowing, logs correlated.
+Delivered as `internal/obs`, the only package that imports dd-trace-go. Plus
+`deploy/datadog/dashboard.json` and a `make dashboard` target.
+
+**Test:** not `mocktracer` — it does not capture Agent Observability spans. The right tool
+turned out to be `instrumentation/testutils/testtracer`, which stands up a fake agent and
+captures the actual submitted payloads, including LLM Obs span events. The acceptance test
+runs the real pipeline against it and asserts the span kinds, the nesting, the session
+grouping, the metric keys and their units. Verified additionally against a real local agent
+(7.84.2): see finding 21.
 
 ### Phase 6 — LLM in the loop (moved forward)
 
@@ -455,6 +461,65 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     delta, with one case that always wraps. Worth remembering for the phase-8 load
     generator: anything that reassembles a stream must use signed-delta arithmetic, never a
     numeric sort.
+
+17. **`mocktracer` cannot test Agent Observability spans; `testtracer` can.** The plan
+    called for `mocktracer`, which only records APM spans. LLM Obs spans travel a separate
+    submission path, so a `mocktracer` assertion would have passed while the Agent
+    Observability views stayed empty. `instrumentation/testutils/testtracer` stands up a
+    fake agent and exposes `WaitForLLMObsSpans`, which returns the real submitted span
+    events — kinds, parents, session IDs, metrics and all. Asserting on the wrapper instead
+    would have proven nothing about what Datadog receives.
+
+18. **`llmobs.WithError(nil)` panics, despite the documentation promising it is a no-op.**
+    This is a real defect in dd-trace-go v2.11.1. `WithError` calls `errortrace.WrapN`,
+    which correctly returns a nil `*TracerError`; assigning that typed nil to the config's
+    `error`-typed field leaves a **non-nil** interface, and `Finish` then calls `Error()`
+    on it and dereferences the nil inner error. The consequence is severe: the
+    single-deferred-`Finish(err)` pattern the SDK docs explicitly recommend **panics on
+    every successful span**. The APM side is unaffected, since `tracer.WithError` assigns
+    the error directly. `Span.Finish` guards against it, and two tests pin the behavior —
+    one asserting no panic, one reproducing the upstream defect so a future fixed release
+    makes the workaround's removal visible. This is the clearest argument for confining
+    the SDK to one package: the workaround is three lines in one file.
+
+19. **Time to first token is in seconds, and nothing in the API says so.**
+    `MetricKeyTimeToFirstToken` takes a bare `float64`. The Go SDK reference's example
+    passes `0.25`, which only makes sense as seconds. Sending milliseconds would overstate
+    latency a thousandfold and quietly ruin every responsiveness chart. The conversion
+    happens once, in `obs.Metrics`, and a test asserts `621ms` arrives as `0.621`.
+
+20. **Token counts must not also go over DogStatsD.** Datadog derives platform metrics
+    (`ml_obs.span.llm.input.tokens` and friends) from the recognized token attributes on
+    LLM Obs spans. Emitting them again as custom metrics would double count. The split is
+    therefore: transport and call-level figures over DogStatsD, AI figures as span
+    attributes. A test asserts no metric with "token" in its name is ever emitted.
+
+21. **Verified against a real agent, and the 403 was the proof.** Pointing the gateway at
+    a local agent 7.84.2 with a deliberately invalid API key produced
+    `llmobs: failed to push span events: ... 403 ... API key is missing or invalid`. That
+    error is the confirmation: the app built the span events, the agent accepted them and
+    proxied them to Datadog's intake via `evp_proxy`, and only authentication failed.
+    DogStatsD separately logged 987 metric packets with zero parse errors. With a valid
+    key the data lands.
+
+22. **A missing agent must fail loudly, not silently.** With LLM Obs enabled in agent mode
+    and no agent reachable, `tracer.Start` returns an error and the gateway exits. That is
+    deliberate: discovering mid-presentation that the dashboards are empty is far worse
+    than failing at launch. The error names all four remedies. Telemetry is off by default
+    so the demo still runs with no agent at all.
+
+23. **Starting a span reassigns `ctx`, which raced with an existing goroutine.** Adding the
+    workflow span to the pipeline introduced `wf, ctx := StartWorkflow(ctx, ...)` *after*
+    the audio-tee goroutine had already captured the `ctx` variable — a closure-capture
+    data race the detector caught immediately. The fix is also what the SDK documents:
+    open the span before launching any goroutine, and hand the goroutine the context the
+    constructor returned.
+
+24. **The gateway cannot know the client's network profile.** The call tags originally
+    labeled the gateway's provider-impairment profile as `chaos_profile`, which attributed
+    client-side impairment to the server: nothing in an RTP stream says how it was
+    degraded. Renamed to `provider_profile`. The network profile becomes taggable once the
+    control plane carries it at call setup — a fourth thing waiting on that message.
 
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5

@@ -16,6 +16,9 @@ services:
       - "${VOICE_RTP_PORT:-5004}:5004/udp"   # RTP media
       - "${VOICE_GRPC_PORT:-50051}:50051"    # gRPC control plane
       - "${VOICE_HTTP_PORT:-8080}:8080"      # /chaos, /healthz, /metrics
+    command:
+      - "-dd"
+      - "-report-interval=10s"
     environment:
       DD_ENV: ${DD_ENV:-demo}
       DD_SERVICE: ${DD_SERVICE:-voicegw}
@@ -31,10 +34,15 @@ services:
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # The call log goes to stdout so the agent collects it from the container
+      # log stream, with no file to mount.
+      VOICE_CALL_LOG: "-"
     volumes:
       # drop a GCP service-account JSON here for phase 7; dir is gitignored
       - ./secrets:/run/secrets:ro,z
     labels:
+      # The call log is JSON lines on stdout; this tells the agent to parse it
+      # as JSON so dd.trace_id correlation works.
       com.datadoghq.ad.logs: '[{"source":"go","service":"voicegw"}]'
     depends_on:
       - datadog-agent

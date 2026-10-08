@@ -1,0 +1,528 @@
+{
+  "title": "Voice Demo — SIP/RTP to AI pipeline",
+  "description": "One call's journey: packets in, jitter buffered, transcribed, answered, spoken. The left column is the network, the middle is the buffer's response to it, the right is what the AI layer made of the result. Read it left to right to see a lossy network become a less confident transcript.\n\nMetric names are asserted against internal/obs.MetricNames() by a test, so this dashboard cannot drift from the code.",
+  "layout_type": "ordered",
+  "template_variables": [
+    {
+      "name": "env",
+      "prefix": "env",
+      "available_values": [],
+      "default": "demo"
+    },
+    {
+      "name": "provider_profile",
+      "prefix": "provider_profile",
+      "available_values": [],
+      "default": "*"
+    }
+  ],
+  "widgets": [
+    {
+      "definition": {
+        "type": "note",
+        "content": "**Network** — measured only from what arrived, exactly as a real gateway must. Trailing loss is invisible without an end-of-call packet count; see docs/plan.md.",
+        "background_color": "blue",
+        "font_size": "14",
+        "text_align": "left",
+        "vertical_align": "top",
+        "show_tick": false,
+        "tick_pos": "50%",
+        "tick_edge": "left",
+        "has_padding": true
+      },
+      "layout": { "x": 0, "y": 0, "width": 12, "height": 1 }
+    },
+    {
+      "definition": {
+        "title": "Estimated MOS (p50)",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "query_value",
+        "requests": [
+          {
+            "formulas": [{ "formula": "query1" }],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.mos.estimate{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "scalar",
+            "conditional_formats": [
+              { "comparator": "<", "value": 2.5, "palette": "white_on_red" },
+              { "comparator": "<", "value": 3.6, "palette": "white_on_yellow" },
+              { "comparator": ">=", "value": 3.6, "palette": "white_on_green" }
+            ]
+          }
+        ],
+        "autoscale": false,
+        "precision": 2
+      },
+      "layout": { "x": 0, "y": 1, "width": 3, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Packet loss %",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "p50" },
+              { "formula": "query2", "alias": "p95" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.rtp.loss_pct{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p95:voice.rtp.loss_pct{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "warm", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 3, "y": 1, "width": 4, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Interarrival jitter (RFC 3550)",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "p50 ms" },
+              { "formula": "query2", "alias": "p95 ms" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.rtp.jitter_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p95:voice.rtp.jitter_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "warm", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 7, "y": 1, "width": 5, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Packets: received vs lost vs reordered",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "received" },
+              { "formula": "query2", "alias": "lost" },
+              { "formula": "query3", "alias": "reordered" },
+              { "formula": "query4", "alias": "duplicated" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "sum:voice.rtp.packets.received{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "sum:voice.rtp.packets.lost{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query3",
+                "query": "sum:voice.rtp.packets.reordered{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query4",
+                "query": "sum:voice.rtp.packets.duplicated{$env,$provider_profile}.as_count()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "dog_classic", "line_type": "solid", "line_width": "normal" },
+            "display_type": "bars"
+          }
+        ]
+      },
+      "layout": { "x": 0, "y": 3, "width": 12, "height": 2 }
+    },
+    {
+      "definition": {
+        "type": "note",
+        "content": "**Jitter buffer** — the latency/loss trade-off. `late_drops` is audio that *arrived* and was thrown away for being too late; `conceal_pct` is audio the listener heard filler in. Deepening the buffer trades the first for added delay.",
+        "background_color": "orange",
+        "font_size": "14",
+        "text_align": "left",
+        "vertical_align": "top",
+        "show_tick": false,
+        "tick_pos": "50%",
+        "tick_edge": "left",
+        "has_padding": true
+      },
+      "layout": { "x": 0, "y": 5, "width": 12, "height": 1 }
+    },
+    {
+      "definition": {
+        "title": "Concealment % vs late drops",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [{ "formula": "query1", "alias": "conceal % (p50)" }],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.jbuf.conceal_pct{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "warm", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          },
+          {
+            "formulas": [{ "formula": "query2", "alias": "late drops" }],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "sum:voice.jbuf.late_drops{$env,$provider_profile}.as_count()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "purple", "line_type": "solid", "line_width": "normal" },
+            "display_type": "bars",
+            "on_right_yaxis": true
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 0, "y": 6, "width": 6, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Buffer depth: actual vs target",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "depth ms (p50)" },
+              { "formula": "query2", "alias": "target ms (p50)" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.jbuf.depth_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p50:voice.jbuf.target_depth_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "cool", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 6, "y": 6, "width": 6, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Buffer losses: concealed / evicted / underruns",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "concealed" },
+              { "formula": "query2", "alias": "evicted (latency cap)" },
+              { "formula": "query3", "alias": "underruns" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "sum:voice.jbuf.concealed{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "sum:voice.jbuf.evicted{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query3",
+                "query": "sum:voice.jbuf.underruns{$env,$provider_profile}.as_count()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "orange", "line_type": "solid", "line_width": "normal" },
+            "display_type": "bars"
+          }
+        ]
+      },
+      "layout": { "x": 0, "y": 8, "width": 12, "height": 2 }
+    },
+    {
+      "definition": {
+        "type": "note",
+        "content": "**AI pipeline** — `call.concealed_pct` is the bridge: it is the share of audio the *recognizer* heard as filler, and it should track the network loss above. Token counts and time-to-first-token live on the Agent Observability spans, not here, because Datadog derives its own platform metrics from those span attributes.",
+        "background_color": "green",
+        "font_size": "14",
+        "text_align": "left",
+        "vertical_align": "top",
+        "show_tick": false,
+        "tick_pos": "50%",
+        "tick_edge": "left",
+        "has_padding": true
+      },
+      "layout": { "x": 0, "y": 10, "width": 12, "height": 1 }
+    },
+    {
+      "definition": {
+        "title": "End-to-end reply latency — the dead air a caller hears",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "e2e p50" },
+              { "formula": "query2", "alias": "e2e p95" },
+              { "formula": "query3", "alias": "llm p95" },
+              { "formula": "query4", "alias": "tts first byte p95" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.call.e2e_latency_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p95:voice.call.e2e_latency_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query3",
+                "query": "p95:voice.llm.latency_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query4",
+                "query": "p95:voice.tts.first_byte_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "purple", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 0, "y": 11, "width": 7, "height": 3 }
+    },
+    {
+      "definition": {
+        "title": "Time to first partial transcript",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "p50 ms" },
+              { "formula": "query2", "alias": "p95 ms" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.stt.first_partial_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p95:voice.stt.first_partial_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "green", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 7, "y": 11, "width": 5, "height": 3 }
+    },
+    {
+      "definition": {
+        "title": "Audio the recognizer heard as filler (%)",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [{ "formula": "query1", "alias": "concealed into STT (p50)" }],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.call.concealed_pct{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "warm", "line_type": "solid", "line_width": "normal" },
+            "display_type": "area"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 0, "y": 14, "width": 6, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Turns, tool calls and failures",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "turns" },
+              { "formula": "query2", "alias": "tool calls" },
+              { "formula": "query3", "alias": "turn errors" },
+              { "formula": "query4", "alias": "audio frames dropped" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "sum:voice.call.turns{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "sum:voice.call.tool_calls{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query3",
+                "query": "sum:voice.call.errors{$env,$provider_profile}.as_count()"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query4",
+                "query": "sum:voice.call.pipeline_dropped{$env,$provider_profile}.as_count()"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "dog_classic", "line_type": "solid", "line_width": "normal" },
+            "display_type": "bars"
+          }
+        ]
+      },
+      "layout": { "x": 6, "y": 14, "width": 6, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Call and audio duration",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "wall-clock p50 ms" },
+              { "formula": "query2", "alias": "audio in p50 ms" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.call.duration_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p50:voice.call.audio_in_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "cool", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 0, "y": 16, "width": 6, "height": 2 }
+    },
+    {
+      "definition": {
+        "title": "Final transcript latency",
+        "title_size": "16",
+        "title_align": "left",
+        "type": "timeseries",
+        "requests": [
+          {
+            "formulas": [
+              { "formula": "query1", "alias": "p50 ms" },
+              { "formula": "query2", "alias": "p95 ms" }
+            ],
+            "queries": [
+              {
+                "data_source": "metrics",
+                "name": "query1",
+                "query": "p50:voice.stt.final_ms{$env,$provider_profile}"
+              },
+              {
+                "data_source": "metrics",
+                "name": "query2",
+                "query": "p95:voice.stt.final_ms{$env,$provider_profile}"
+              }
+            ],
+            "response_format": "timeseries",
+            "style": { "palette": "green", "line_type": "solid", "line_width": "normal" },
+            "display_type": "line"
+          }
+        ],
+        "yaxis": { "include_zero": true, "min": "0" }
+      },
+      "layout": { "x": 6, "y": 16, "width": 6, "height": 2 }
+    }
+  ]
+}
