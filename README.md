@@ -22,8 +22,8 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 5 | Datadog instrumentation | done |
 | — | gRPC control plane (call setup/teardown) | done |
 | 6 | LLM in the loop (real agent, tool definitions, cost, evaluations) | done |
-| 7 | Real Google STT/TTS | next |
-| 8 | Load generator, demo script, dashboard | |
+| 7 | Real Google STT/TTS | done |
+| 8 | Load generator, demo script, dashboard | next |
 | 9 | Demo polish | |
 
 The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
@@ -31,9 +31,11 @@ agent reply with a tool call, synthesized audio out — reported as APM traces, 
 Observability spans with token counts, cost and per-call evaluations, DogStatsD metrics and
 a correlated call log.
 
-Speech recognition and synthesis are still deterministic mocks, so `make test` needs no
-credentials and spends nothing. The agent is a mock too by default; `-real-llm` swaps in
-Claude. Telemetry is off by default, so the demo also runs with no Datadog agent at all.
+All three AI stages have a real implementation and a deterministic mock, and the mocks are
+the defaults: `make test` needs no credentials and spends nothing. `-real-stt` swaps in
+Google Speech-to-Text v2, `-real-tts` Google Text-to-Speech, `-real-llm` Claude — each
+independently. Telemetry is off by default, so the demo also runs with no Datadog agent at
+all.
 
 ## Quick start
 
@@ -191,6 +193,69 @@ contrast demonstrable:
 ```
 
 Pass `-require-signaling` to the gateway to reject unsignaled media instead.
+
+## Running the real speech providers
+
+Recognition and synthesis are mocks by default; the two flags are independent, so each
+stage can be real while the other stays reproducible:
+
+```bash
+./bin/voicegw -addr 127.0.0.1:5004 -real-stt -real-tts -google-project YOUR_PROJECT -dd
+```
+
+Credentials come from Application Default Credentials. On a laptop:
+
+```bash
+gcloud auth application-default login
+gcloud auth application-default set-quota-project YOUR_PROJECT
+```
+
+A project is required for both APIs, not just for billing: user credentials carry no
+project of their own, and both services reject a request that does not name one to charge.
+`-google-project` or `GOOGLE_CLOUD_PROJECT` supplies it; in the container,
+`GOOGLE_APPLICATION_CREDENTIALS` points at a mounted service-account JSON instead and that
+file carries its own project.
+
+Enable both APIs once per project:
+
+```bash
+gcloud services enable speech.googleapis.com texttospeech.googleapis.com --project YOUR_PROJECT
+```
+
+Tuning flags: `-stt-model` (default `telephony`, the v2 model trained on 8 kHz phone
+audio), `-stt-language`, `-google-location`, `-tts-voice` (default `en-US-Neural2-C`),
+`-tts-language`. The language has to match the voice, or the service quietly substitutes a
+different one.
+
+Audio is sent at the 8 kHz the wire already carries, not upsampled: Google's own guidance
+is to use the source's native rate rather than resample, and interpolating telephony audio
+to 16 kHz adds nothing a recognizer can use. Synthesis is requested as headerless 8 kHz
+PCM for the same reason — it drops straight into the return RTP stream.
+
+Which pairing to use depends on what a run is for:
+
+| Run | Why |
+|---|---|
+| mock STT + mock TTS | reproducible; a dashboard change is a *network* change |
+| real STT + mock TTS | genuine transcripts, with reply audio still verifiable by tone |
+| real STT + real TTS | a call a person can listen to end to end |
+
+The gateway logs what is serving each stage at startup, so it never has to be inferred
+from the dashboards:
+
+```
+stt: google telephony, en-US, 8000 Hz, project demo-proj in global
+agent: mock (scripted; pass -real-llm for the Anthropic API)
+tts: google en-US-Neural2-C, en-US, 8000 Hz
+```
+
+Live provider tests are behind the integration build tag and skip without
+`GOOGLE_CLOUD_PROJECT` and credentials. They synthesize a phrase, run it through G.711 and
+the real recognizer, and compare the transcript by **word error rate** rather than by
+equality — a recognizer that hears "four seven two nine" as "4729" has not failed. One of
+them conceals a third of the frames and asserts the transcript gets worse, which is the
+demo's central claim checked against a real recognizer instead of a mock written to
+degrade.
 
 ## Running a real agent
 

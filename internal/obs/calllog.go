@@ -20,9 +20,11 @@ import (
 
 // TurnRecord is one agent turn in the call log.
 type TurnRecord struct {
-	Index        int      `json:"index"`
-	Transcript   string   `json:"transcript"`
-	Confidence   float64  `json:"confidence"`
+	Index      int    `json:"index"`
+	Transcript string `json:"transcript"`
+	// Confidence is omitted when the recognizer reported none, so a search for
+	// low-confidence turns cannot be fooled by an unreported one.
+	Confidence   *float64 `json:"confidence,omitempty"`
 	Reply        string   `json:"reply,omitempty"`
 	ToolCalls    []string `json:"tool_calls,omitempty"`
 	ToolRounds   int      `json:"tool_rounds,omitempty"`
@@ -103,9 +105,15 @@ type CallRecord struct {
 
 	// MeanConfidence and AudioQuality are the figures submitted as the call's
 	// evaluations. They are repeated here so a log line tells the same story as
-	// the Evaluations view, which is what makes the two cross-checkable.
-	MeanConfidence float64 `json:"mean_confidence,omitempty"`
-	AudioQuality   string  `json:"audio_quality,omitempty"`
+	// the Evaluations view, which is what makes the two cross-checkable. A nil
+	// MeanConfidence means the recognizer scored nothing, which is also when
+	// the evaluation is not submitted.
+	MeanConfidence *float64 `json:"mean_confidence,omitempty"`
+	AudioQuality   string   `json:"audio_quality,omitempty"`
+
+	// STTError records a recognizer that failed partway through the call, as
+	// opposed to Error, which is the call failing outright.
+	STTError string `json:"stt_error,omitempty"`
 
 	FirstPartialMs int64   `json:"first_partial_ms,omitempty"`
 	ConcealedInPct float64 `json:"concealed_in_pct"`

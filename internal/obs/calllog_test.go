@@ -144,7 +144,7 @@ func TestCallLogCarriesAllThreeLayers(t *testing.T) {
 		Turns: []TurnRecord{{
 			Index:      0,
 			Transcript: "hello I'm calling about my account balance",
-			Confidence: 0.87,
+			Confidence: floatPtr(0.87),
 			Reply:      "I've pulled up your account.",
 			ToolCalls:  []string{"lookup_account"},
 			ToolRounds: 2,
@@ -299,5 +299,41 @@ func TestCallLogIsConcurrencySafe(t *testing.T) {
 		if err := json.Unmarshal([]byte(line), &rec); err != nil {
 			t.Fatalf("line %d was corrupted by concurrent writes: %v", i, err)
 		}
+	}
+}
+
+func floatPtr(v float64) *float64 { return &v }
+
+// A recognizer that reported no confidence must leave the field out rather
+// than log a zero: a search for low-confidence turns would otherwise match
+// every turn whose provider simply declined to score it.
+func TestCallLogOmitsUnreportedConfidence(t *testing.T) {
+	var buf bytes.Buffer
+	log := NewCallLogTo(&buf)
+
+	err := log.Write(CallRecord{
+		CallID:    "c-noconf",
+		Event:     "call.end",
+		TurnCount: 1,
+		Turns: []TurnRecord{{
+			Index:      0,
+			Transcript: "can you transfer me to billing please",
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(buf.Bytes(), &got); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := got["mean_confidence"]; ok {
+		t.Error("mean_confidence is present although none was reported")
+	}
+
+	turn := got["turns"].([]any)[0].(map[string]any)
+	if _, ok := turn["confidence"]; ok {
+		t.Errorf("the turn logged a confidence although none was reported: %v", turn["confidence"])
 	}
 }

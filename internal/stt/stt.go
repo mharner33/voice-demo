@@ -33,17 +33,29 @@ type Result struct {
 	IsFinal bool
 	// Confidence is 0-1. Providers typically report it only on finals.
 	Confidence float64
+	// ConfidenceUnknown is set when the provider returned no confidence figure
+	// at all, which Google's API explicitly permits. Without this flag a
+	// missing figure would arrive as a confident zero and drag the call's
+	// quality evaluation down for a transcript that may be perfectly good.
+	// The zero value means the confidence above is real, so a provider that
+	// always reports one never has to think about this.
+	ConfidenceUnknown bool
 	// AudioDuration is how much audio had been consumed when this result was
 	// produced, which is what makes a mock's output reproducible and a real
 	// provider's latency attributable.
 	AudioDuration time.Duration
+	// Err reports a failure that ended the stream partway through. The channel
+	// closes after it, so a consumer sees at most one. It exists because a
+	// recognizer that dies mid-call would otherwise be indistinguishable from
+	// a caller who stopped talking: both simply close the channel.
+	Err error
 }
 
 // Info identifies the implementation, for annotating LLM Observability spans
 // with the model and provider that actually served the call.
 type Info struct {
 	Provider   string // "mock", "google"
-	Model      string // "scripted", "latest_long"
+	Model      string // "scripted", "telephony"
 	SampleRate int    // the rate the transcriber expects
 }
 

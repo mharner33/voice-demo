@@ -60,6 +60,23 @@ func main() {
 		ttsLatency = flag.Duration("tts-latency", -1, "override TTS added latency")
 		seed       = flag.Int64("fault-seed", 1, "seed for provider fault injection")
 
+		realSTT = flag.Bool("real-stt", envBool("VOICE_REAL_STT", false),
+			"use Google Speech-to-Text v2 for recognition instead of the scripted mock")
+		realTTS = flag.Bool("real-tts", envBool("VOICE_REAL_TTS", false),
+			"use Google Cloud Text-to-Speech for synthesis instead of the tone mock")
+		googleProject = flag.String("google-project", envOr("GOOGLE_CLOUD_PROJECT", ""),
+			"Google Cloud project billed for -real-stt and -real-tts")
+		googleLocation = flag.String("google-location", envOr("GOOGLE_CLOUD_LOCATION", stt.DefaultGoogleLocation),
+			"Google Cloud location for -real-stt (a non-global one needs a regional endpoint)")
+		sttModel = flag.String("stt-model", envOr("VOICE_STT_MODEL", stt.DefaultGoogleModel),
+			"Google recognition model for -real-stt: telephony, telephony_short, long, short")
+		sttLanguage = flag.String("stt-language", envOr("VOICE_STT_LANGUAGE", stt.DefaultGoogleLanguage),
+			"BCP-47 language tag for -real-stt")
+		ttsVoice = flag.String("tts-voice", envOr("VOICE_TTS_VOICE", tts.DefaultGoogleVoice),
+			"Google voice name for -real-tts")
+		ttsLanguage = flag.String("tts-language", envOr("VOICE_TTS_LANGUAGE", tts.DefaultGoogleLanguage),
+			"BCP-47 language tag for -real-tts; must match the voice")
+
 		realLLM = flag.Bool("real-llm", envBool("VOICE_REAL_LLM", false),
 			"use the Anthropic API for the agent turn instead of the scripted mock")
 		llmModel = flag.String("llm-model", envOr("VOICE_LLM_MODEL", llm.DefaultAnthropicModel),
@@ -119,14 +136,27 @@ func main() {
 		pv.TTSExtraLatencyMs = float64(ttsLatency.Milliseconds())
 	}
 
-	p, err := buildProviders(pv, *seed, agentConfig{
-		real:   *realLLM,
-		model:  *llmModel,
-		effort: *llmEffort,
+	p, err := buildProviders(context.Background(), pv, *seed, providerChoice{
+		agent: agentConfig{
+			real:   *realLLM,
+			model:  *llmModel,
+			effort: *llmEffort,
+		},
+		speech: speechConfig{
+			realSTT:  *realSTT,
+			realTTS:  *realTTS,
+			project:  *googleProject,
+			location: *googleLocation,
+			model:    *sttModel,
+			sttLang:  *sttLanguage,
+			voice:    *ttsVoice,
+			ttsLang:  *ttsLanguage,
+		},
 	})
 	if err != nil {
 		log.Fatalf("voicegw: %v", err)
 	}
+	defer p.close()
 
 	tracerT, err := obs.Start(obs.Config{
 		Enabled:       *ddEnabled,
@@ -214,13 +244,37 @@ type providers struct {
 	tts   tts.Synthesizer
 	tools *llm.Registry
 
-	// llmDescription is logged at startup. Which agent is answering changes
-	// what a demo costs and how it behaves, so it should never be a guess.
+	// The descriptions are logged at startup. Which providers are serving a
+	// run changes what it costs and how reproducible it is, so none of it
+	// should ever be a guess.
+	sttDescription string
 	llmDescription string
+	ttsDescription string
 
 	// forget releases a call's state at teardown, for an agent that keeps
 	// conversation history. It is nil for the stateless mock.
 	forget func(callID string)
+
+	// closers release the cloud clients at shutdown. Empty for the mocks,
+	// which hold no connections.
+	closers []func() error
+}
+
+// close releases every provider's resources, reporting failures rather than
+// discarding them: a client that will not close is usually a client that was
+// in a worse state than this process noticed.
+func (p providers) close() {
+	for _, c := range p.closers {
+		if err := c(); err != nil {
+			log.Printf("closing a provider: %v", err)
+		}
+	}
+}
+
+// providerChoice selects the implementations for a run.
+type providerChoice struct {
+	agent  agentConfig
+	speech speechConfig
 }
 
 // agentConfig selects the agent implementation.
@@ -228,6 +282,24 @@ type agentConfig struct {
 	real   bool
 	model  string
 	effort string
+}
+
+// speechConfig selects the recognizer and synthesizer implementations.
+//
+// The two are independent flags rather than one "-real" switch, because the
+// interesting comparisons run them separately: real recognition with the mock
+// synthesizer keeps the reply audio verifiable by frequency while proving the
+// transcript is genuine, and real synthesis with the mock recognizer gives an
+// audible demo with a fixed transcript.
+type speechConfig struct {
+	realSTT  bool
+	realTTS  bool
+	project  string
+	location string
+	model    string
+	sttLang  string
+	voice    string
+	ttsLang  string
 }
 
 // buildAgent returns the agent for this run, plus a description and a teardown
@@ -266,7 +338,73 @@ func buildAgent(cfg agentConfig, tools *llm.Registry) (llm.Agent, string, func(s
 	return agent, desc, agent.Forget, nil
 }
 
-func buildProviders(pv chaos.Provider, seed int64, ac agentConfig) (providers, error) {
+// buildTranscriber returns the recognizer for this run, plus a description and
+// a closer for the client it may hold.
+//
+// The mock remains the default for the same reason the mock agent does: it is
+// a function of how much audio it consumed, so the same call transcribes
+// identically every time and a change in the dashboards between two runs is a
+// change in the network rather than in the weather over a datacentre.
+func buildTranscriber(ctx context.Context, cfg speechConfig) (stt.Transcriber, string, func() error, error) {
+	if !cfg.realSTT {
+		m, err := stt.NewMock(stt.MockConfig{DegradeOnConcealed: true})
+		if err != nil {
+			return nil, "", nil, err
+		}
+		return m, "mock (scripted; pass -real-stt for Google Speech-to-Text)", nil, nil
+	}
+
+	g, err := stt.NewGoogle(ctx, stt.GoogleConfig{
+		Project:  cfg.project,
+		Location: cfg.location,
+		Model:    cfg.model,
+		Language: cfg.sttLang,
+		// Credentials come from Application Default Credentials, so no key
+		// passes through this program's flags or logs.
+	})
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	info := g.Info()
+	desc := fmt.Sprintf("google %s, %s, %d Hz, project %s in %s",
+		info.Model, cfg.sttLang, info.SampleRate, cfg.project, cfg.location)
+	return g, desc, g.Close, nil
+}
+
+// buildSynthesizer returns the synthesizer for this run, plus a description
+// and a closer.
+//
+// The mock's tone is derived from the reply text, which is what lets a test
+// prove the agent's specific words reached the caller as audio. The real voice
+// is what lets a person listen to the call. Both are useful; which one a run
+// wants depends on whether it is being asserted on or demonstrated.
+func buildSynthesizer(ctx context.Context, cfg speechConfig) (tts.Synthesizer, string, func() error, error) {
+	if !cfg.realTTS {
+		m, err := tts.NewMock(tts.MockConfig{})
+		if err != nil {
+			return nil, "", nil, err
+		}
+		return m, "mock (tone; pass -real-tts for Google Text-to-Speech)", nil, nil
+	}
+
+	g, err := tts.NewGoogle(ctx, tts.GoogleConfig{
+		Project:  cfg.project,
+		Voice:    cfg.voice,
+		Language: cfg.ttsLang,
+	})
+	if err != nil {
+		return nil, "", nil, err
+	}
+
+	info := g.Info()
+	desc := fmt.Sprintf("google %s, %s, %d Hz", info.Model, cfg.ttsLang, info.SampleRate)
+	return g, desc, g.Close, nil
+}
+
+func buildProviders(ctx context.Context, pv chaos.Provider, seed int64,
+	choice providerChoice) (providers, error) {
+
 	ms := func(v float64) time.Duration { return time.Duration(v) * time.Millisecond }
 
 	tools, err := llm.DefaultRegistry()
@@ -274,17 +412,37 @@ func buildProviders(pv chaos.Provider, seed int64, ac agentConfig) (providers, e
 		return providers{}, err
 	}
 
-	transcriber, err := stt.NewMock(stt.MockConfig{DegradeOnConcealed: true})
+	var closers []func() error
+
+	transcriber, sttDesc, closeSTT, err := buildTranscriber(ctx, choice.speech)
 	if err != nil {
 		return providers{}, err
 	}
-	agent, agentDesc, forget, err := buildAgent(ac, tools)
+	if closeSTT != nil {
+		closers = append(closers, closeSTT)
+	}
+
+	agent, agentDesc, forget, err := buildAgent(choice.agent, tools)
 	if err != nil {
 		return providers{}, err
 	}
-	synth, err := tts.NewMock(tts.MockConfig{})
+
+	synth, ttsDesc, closeTTS, err := buildSynthesizer(ctx, choice.speech)
 	if err != nil {
 		return providers{}, err
+	}
+	if closeTTS != nil {
+		closers = append(closers, closeTTS)
+	}
+
+	// The return path companders synthesized audio straight into G.711 and
+	// paces it at one frame per packetization interval, so anything but the
+	// wire rate would be played back to the caller at the wrong speed. Caught
+	// here rather than heard later.
+	if r := synth.Info().SampleRate; r != codec.SampleRate8k {
+		return providers{}, fmt.Errorf(
+			"the synthesizer produces %d Hz audio but the return RTP stream carries %d Hz",
+			r, codec.SampleRate8k)
 	}
 
 	faultySTT, err := stt.WithFaults(transcriber, faults.Config{
@@ -308,7 +466,11 @@ func buildProviders(pv chaos.Provider, seed int64, ac agentConfig) (providers, e
 
 	return providers{
 		stt: faultySTT, llm: faultyLLM, tts: faultyTTS, tools: tools,
-		llmDescription: agentDesc, forget: forget,
+		sttDescription: sttDesc,
+		llmDescription: agentDesc,
+		ttsDescription: ttsDesc,
+		forget:         forget,
+		closers:        closers,
 	}, nil
 }
 
@@ -342,12 +504,12 @@ func run(cfg runConfig) error {
 	log.Printf("jitter buffer: target %d frames (%dms), max %d frames (%dms), conceal=%s, adaptive=%v",
 		cfg.jbCfg.TargetDepth, cfg.jbCfg.TargetDepth*20, cfg.jbCfg.MaxDepth,
 		cfg.jbCfg.MaxDepth*20, cfg.jbCfg.Conceal, cfg.jbCfg.Adaptive)
-	log.Printf("providers: stt=%s/%s tts=%s/%s",
-		cfg.providers.stt.Info().Provider, cfg.providers.stt.Info().Model,
-		cfg.providers.tts.Info().Provider, cfg.providers.tts.Info().Model)
-	// The agent gets its own line because which one is answering changes what
-	// the demo costs and how reproducible it is.
+	// One line per provider, because which implementation is serving a run
+	// changes what the demo costs and how reproducible it is. None of it
+	// should have to be inferred from the dashboards afterwards.
+	log.Printf("stt: %s", cfg.providers.sttDescription)
 	log.Printf("agent: %s", cfg.providers.llmDescription)
+	log.Printf("tts: %s", cfg.providers.ttsDescription)
 	log.Print(cfg.tel.tracer.Describe())
 	if cfg.requireSignaling {
 		log.Print("requiring StartCall before media")

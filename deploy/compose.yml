@@ -28,20 +28,27 @@ services:
       DD_DOGSTATSD_PORT: "8125"
       DD_LLMOBS_ENABLED: ${DD_LLMOBS_ENABLED:-true}
       DD_LLMOBS_ML_APP: ${DD_LLMOBS_ML_APP:-voice-demo}
-      VOICE_STT_PROVIDER: ${VOICE_STT_PROVIDER:-mock}
-      VOICE_TTS_PROVIDER: ${VOICE_TTS_PROVIDER:-mock}
+      # Speech: mocks unless VOICE_REAL_STT / VOICE_REAL_TTS are true.
+      VOICE_REAL_STT: ${VOICE_REAL_STT:-false}
+      VOICE_REAL_TTS: ${VOICE_REAL_TTS:-false}
+      VOICE_STT_MODEL: ${VOICE_STT_MODEL:-telephony}
+      VOICE_STT_LANGUAGE: ${VOICE_STT_LANGUAGE:-en-US}
+      VOICE_TTS_VOICE: ${VOICE_TTS_VOICE:-en-US-Neural2-C}
+      VOICE_TTS_LANGUAGE: ${VOICE_TTS_LANGUAGE:-en-US}
       # The agent: mock unless VOICE_REAL_LLM is true.
       VOICE_REAL_LLM: ${VOICE_REAL_LLM:-false}
       VOICE_LLM_MODEL: ${VOICE_LLM_MODEL:-claude-opus-5}
       VOICE_LLM_EFFORT: ${VOICE_LLM_EFFORT:-low}
       GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-}
       GOOGLE_CLOUD_PROJECT: ${GOOGLE_CLOUD_PROJECT:-}
+      GOOGLE_CLOUD_LOCATION: ${GOOGLE_CLOUD_LOCATION:-global}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
       # The call log goes to stdout so the agent collects it from the container
       # log stream, with no file to mount.
       VOICE_CALL_LOG: "-"
     volumes:
-      # drop a GCP service-account JSON here for phase 7; dir is gitignored
+      # drop a GCP service-account JSON here for -real-stt/-real-tts; the dir
+      # is gitignored
       - ./secrets:/run/secrets:ro,z
     labels:
       # The call log is JSON lines on stdout; this tells the agent to parse it

@@ -92,7 +92,12 @@ type Turn struct {
 	Index      int
 	Transcript string
 	Confidence float64
-	Reply      string
+	// ConfidenceUnknown is set when the recognizer reported no confidence at
+	// all. Google's API permits that, and a missing figure has to stay
+	// distinguishable from a confident zero or it would drag the call's
+	// quality evaluation down for a transcript that may be perfectly good.
+	ConfidenceUnknown bool
+	Reply             string
 
 	// ToolCalls names the tools invoked, in order.
 	ToolCalls []string
@@ -147,8 +152,15 @@ type Result struct {
 
 	// ToolCalls is the total across turns.
 	ToolCalls int
-	// Errors counts turns that hit a provider failure.
+	// Errors counts turns that hit a provider failure, plus a recognizer
+	// failure if there was one.
 	Errors int
+
+	// STTErr records a recognizer that failed partway through the call. It is
+	// kept separately from the turns because it belongs to no turn: the stream
+	// died between them, and without it a recognizer that quit would look
+	// exactly like a caller who stopped talking.
+	STTErr error
 
 	// Duration is wall-clock time for the call.
 	Duration time.Duration
@@ -180,15 +192,38 @@ func (r Result) ConcealedFraction() float64 {
 // MeanConfidence is the recognizer's average confidence across the call's
 // turns. It is the headline AI-quality figure for the demo because it is the
 // one that degrades when the *network* does.
+//
+// Turns whose recognizer reported no confidence are left out of the average
+// rather than counted as zero. A call where none of them reported one averages
+// to zero, which is why HaveConfidence exists to tell that apart from a call
+// that really was recognized badly.
 func (r Result) MeanConfidence() float64 {
-	if len(r.Turns) == 0 {
+	var (
+		sum float64
+		n   int
+	)
+	for _, t := range r.Turns {
+		if t.ConfidenceUnknown {
+			continue
+		}
+		sum += t.Confidence
+		n++
+	}
+	if n == 0 {
 		return 0
 	}
-	var sum float64
+	return sum / float64(n)
+}
+
+// HaveConfidence reports whether MeanConfidence means anything: false when the
+// call had turns but the recognizer declined to score any of them.
+func (r Result) HaveConfidence() bool {
 	for _, t := range r.Turns {
-		sum += t.Confidence
+		if !t.ConfidenceUnknown {
+			return true
+		}
 	}
-	return sum / float64(len(r.Turns))
+	return len(r.Turns) == 0
 }
 
 // RepliedEveryTurn reports whether every turn produced something to say. A call
@@ -343,6 +378,17 @@ func (s *Session) Run(ctx context.Context, audio <-chan stt.Audio) (Result, erro
 	)
 
 	for r := range results {
+		// A recognizer failure ends the stream, so it arrives as the last
+		// thing on the channel rather than alongside a hypothesis. Recorded
+		// rather than returned: the call is over either way, and a call that
+		// transcribed three turns and then lost its recognizer is a different
+		// story from one that never started.
+		if r.Err != nil {
+			res.STTErr = r.Err
+			res.Errors++
+			continue
+		}
+
 		if !r.IsFinal {
 			if !havePartial {
 				havePartial = true
@@ -415,7 +461,11 @@ func (s *Session) Run(ctx context.Context, audio <-chan stt.Audio) (Result, erro
 		wf.Finish(err)
 		return res, err
 	}
-	wf.Finish(nil)
+	// A recognizer that died marks the workflow span, so the failure is
+	// visible in the Agent Observability view rather than only in the log.
+	// The call itself is not returned as failed: the turns it did complete
+	// happened, and reporting the whole call as an error would lose them.
+	wf.Finish(res.STTErr)
 	return res, nil
 }
 
@@ -437,7 +487,14 @@ func (s *Session) recordEvaluations(wf *obs.Span, res Result) {
 	// Submitted even when there were no turns: a call that transcribed nothing
 	// is exactly the outcome worth seeing in the Evaluations view, and omitting
 	// it would quietly bias the series towards calls that went well.
-	s.cfg.Obs.EvalScore(wf, obs.EvalTranscriptConfidence, res.MeanConfidence(), tags)
+	//
+	// The one case that is omitted is a call whose recognizer scored none of
+	// its turns, which Google's API permits. There the figure would be a zero
+	// standing in for "not reported", and a fabricated zero in a score series
+	// is worse than a gap: it reads as a call that went badly.
+	if res.HaveConfidence() {
+		s.cfg.Obs.EvalScore(wf, obs.EvalTranscriptConfidence, res.MeanConfidence(), tags)
+	}
 	s.cfg.Obs.EvalCategorical(wf, obs.EvalAudioQuality,
 		obs.AudioQualityBucket(res.ConcealedFraction()), tags)
 	s.cfg.Obs.EvalBool(wf, obs.EvalReplied, res.RepliedEveryTurn(), tags)
@@ -465,6 +522,18 @@ func (s *Session) recordSTT(ctx context.Context, r stt.Result, utteranceStart ti
 		m.TimeToFirstToken = partialAt
 	}
 
+	metadata := map[string]any{
+		"audio_frames":   frames,
+		"concealed":      concealed,
+		"sample_rate":    info.SampleRate,
+		"audio_duration": codec.Duration8k(frames * codec.SamplesPerFrame).Seconds(),
+	}
+	// A recognizer that reported no confidence gets no confidence attribute,
+	// rather than a zero that would read as certainty the transcript is wrong.
+	if !r.ConfidenceUnknown {
+		metadata["confidence"] = r.Confidence
+	}
+
 	span.LLMIO(
 		[]obs.Message{{
 			Role:    "user",
@@ -472,13 +541,7 @@ func (s *Session) recordSTT(ctx context.Context, r stt.Result, utteranceStart ti
 		}},
 		[]obs.Message{{Role: "assistant", Content: r.Text}},
 		m,
-		map[string]any{
-			"confidence":     r.Confidence,
-			"audio_frames":   frames,
-			"concealed":      concealed,
-			"sample_rate":    info.SampleRate,
-			"audio_duration": codec.Duration8k(frames * codec.SamplesPerFrame).Seconds(),
-		},
+		metadata,
 	)
 	span.Finish(nil)
 }
@@ -486,10 +549,11 @@ func (s *Session) recordSTT(ctx context.Context, r stt.Result, utteranceStart ti
 // handleTurn runs the agent and synthesizer for one finalized utterance.
 func (s *Session) handleTurn(ctx context.Context, idx int, final stt.Result, start time.Time) Turn {
 	turn := Turn{
-		Index:      idx,
-		Transcript: final.Text,
-		Confidence: final.Confidence,
-		FinalAt:    time.Since(start),
+		Index:             idx,
+		Transcript:        final.Text,
+		Confidence:        final.Confidence,
+		ConfidenceUnknown: final.ConfidenceUnknown,
+		FinalAt:           time.Since(start),
 	}
 
 	// The agent span is the parent of this turn's model calls and tool calls,

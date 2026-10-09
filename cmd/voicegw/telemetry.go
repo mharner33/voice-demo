@@ -189,7 +189,13 @@ func (c *activeCall) writeCallLog(reason string, ns rtp.Stats, jb jbuf.Stats,
 		rec.ConcealedInPct = res.ConcealedFraction() * 100
 		rec.FramesOut = res.FramesOut
 		rec.CostUSD = res.CostUSD()
-		rec.MeanConfidence = res.MeanConfidence()
+		if res.HaveConfidence() {
+			mean := res.MeanConfidence()
+			rec.MeanConfidence = &mean
+		}
+		if res.STTErr != nil {
+			rec.STTError = res.STTErr.Error()
+		}
 		rec.AudioQuality = obs.AudioQualityBucket(res.ConcealedFraction())
 		if res.HavePartial {
 			rec.FirstPartialMs = res.FirstPartialAt.Milliseconds()
@@ -198,7 +204,6 @@ func (c *activeCall) writeCallLog(reason string, ns rtp.Stats, jb jbuf.Stats,
 			tr := obs.TurnRecord{
 				Index:        turn.Index,
 				Transcript:   turn.Transcript,
-				Confidence:   turn.Confidence,
 				Reply:        turn.Reply,
 				ToolCalls:    turn.ToolCalls,
 				ToolRounds:   turn.ToolRounds,
@@ -208,6 +213,10 @@ func (c *activeCall) writeCallLog(reason string, ns rtp.Stats, jb jbuf.Stats,
 				LLMMs:        turn.LLMLatency.Milliseconds(),
 				TTSFirstMs:   turn.TTSFirstByte.Milliseconds(),
 				TTSAudioMs:   turn.TTSAudio.Milliseconds(),
+			}
+			if !turn.ConfidenceUnknown {
+				conf := turn.Confidence
+				tr.Confidence = &conf
 			}
 			if turn.Err != nil {
 				tr.Error = turn.Err.Error()
