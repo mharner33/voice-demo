@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/mharner33/voice-demo/internal/faults"
+	"github.com/mharner33/voice-demo/internal/stt"
 )
 
 // newTestAPI builds the endpoint over three tunable injectors, exactly as the
@@ -23,8 +24,16 @@ func newTestAPI(t *testing.T, startProfile string) *chaosAPI {
 		}
 		return i
 	}
+	transcriber, err := stt.NewMock(stt.MockConfig{})
+	if err != nil {
+		t.Fatalf("stt.NewMock: %v", err)
+	}
+
 	return &chaosAPI{
-		faults:    providerFaults{stt: inj(), llm: inj(), tts: inj()},
+		faults: providerFaults{
+			stt: inj(), llm: inj(), tts: inj(),
+			sttStream: stt.WithStreamFault(transcriber),
+		},
 		profile:   newProviderProfile(startProfile),
 		liveCalls: func() int { return 3 },
 	}
@@ -280,5 +289,47 @@ func TestHealthz(t *testing.T) {
 	}
 	if resp["provider_profile"] != "mobile" {
 		t.Errorf("provider_profile = %v, want mobile", resp["provider_profile"])
+	}
+}
+
+// The mid-call recognizer failure is armable over the endpoint, because it is
+// a demo beat like any other — and it is the beat an audience asks for.
+func TestChaosArmsTheMidCallRecognizerFailure(t *testing.T) {
+	api := newTestAPI(t, "clean")
+
+	code, resp := post(t, api, `{"profile":"stt-dropout"}`)
+	if code != http.StatusOK {
+		t.Fatalf("status = %d, body %v", code, resp)
+	}
+	if got := resp["provider_profile"]; got != "stt-dropout" {
+		t.Errorf("profile = %v, want stt-dropout", got)
+	}
+	if got := stage(t, resp, "stt")["fail_after_ms"]; got != 3000.0 {
+		t.Errorf("fail_after_ms = %v, want 3000", got)
+	}
+	if got := api.faults.sttStream.FailAfter(); got != 3*time.Second {
+		t.Errorf("the wrapper is armed for %v, want 3s", got)
+	}
+
+	// And it is cleared by going back to a profile that does not set it, like
+	// every other knob: a beat that could not be turned off would poison the
+	// rest of the session.
+	post(t, api, `{"profile":"clean"}`)
+	if got := api.faults.sttStream.FailAfter(); got != 0 {
+		t.Errorf("still armed for %v after clean", got)
+	}
+}
+
+// A rejected request must not leave the recognizer set to die mid-call, which
+// is why arming happens last.
+func TestChaosRejectedRequestDoesNotArmTheDropout(t *testing.T) {
+	api := newTestAPI(t, "clean")
+
+	code, _ := post(t, api, `{"stt_fail_after_ms":2000,"llm_error_rate":9}`)
+	if code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", code)
+	}
+	if got := api.faults.sttStream.FailAfter(); got != 0 {
+		t.Errorf("a rejected request armed the dropout for %v", got)
 	}
 }

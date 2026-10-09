@@ -60,7 +60,9 @@ func main() {
 		llmLatency = flag.Duration("llm-latency", -1, "override LLM added latency")
 		llmErrors  = flag.Float64("llm-error-rate", -1, "override LLM error rate (0-1)")
 		ttsLatency = flag.Duration("tts-latency", -1, "override TTS added latency")
-		seed       = flag.Int64("fault-seed", 1, "seed for provider fault injection")
+		sttDropout = flag.Duration("stt-fail-after", -1,
+			"kill the recognition stream once a call has carried this much audio (0 disables)")
+		seed = flag.Int64("fault-seed", 1, "seed for provider fault injection")
 
 		realSTT = flag.Bool("real-stt", envBool("VOICE_REAL_STT", false),
 			"use Google Speech-to-Text v2 for recognition instead of the scripted mock")
@@ -138,6 +140,9 @@ func main() {
 	}
 	if *ttsLatency >= 0 {
 		pv.TTSExtraLatencyMs = float64(ttsLatency.Milliseconds())
+	}
+	if *sttDropout >= 0 {
+		pv.STTFailAfterMs = float64(sttDropout.Milliseconds())
 	}
 
 	p, err := buildProviders(context.Background(), pv, *seed, providerChoice{
@@ -273,11 +278,15 @@ type providers struct {
 	faults providerFaults
 }
 
-// providerFaults bundles the three injectors the live endpoint retunes.
+// providerFaults bundles what the live endpoint retunes: the three open-time
+// injectors, and the recognizer's mid-stream fault, which is a different kind
+// of failure and so a different mechanism (see internal/stt/dropout.go).
 type providerFaults struct {
 	stt *faults.Injector
 	llm *faults.Injector
 	tts *faults.Injector
+
+	sttStream *stt.StreamFault
 }
 
 // tunableProvider is implemented by the fault-injecting wrappers. The three
@@ -491,6 +500,12 @@ func buildProviders(ctx context.Context, pv chaos.Provider, seed int64,
 	if err != nil {
 		return providers{}, err
 	}
+	// The mid-stream fault wraps the open-time one, so a call can be failed at
+	// open or part way through, and the wrapper is always present — it is
+	// inert until armed, and /chaos needs something to arm.
+	dropout := stt.WithStreamFault(faultySTT)
+	dropout.SetFailAfter(ms(pv.STTFailAfterMs))
+
 	faultyLLM, err := llm.WithFaults(agent, faults.Config{
 		ExtraLatency: ms(pv.LLMExtraLatencyMs), ErrorRate: pv.LLMErrorRate,
 		Seed: seed + 1, Tunable: true,
@@ -506,16 +521,17 @@ func buildProviders(ctx context.Context, pv chaos.Provider, seed int64,
 	}
 
 	p := providers{
-		stt: faultySTT, llm: faultyLLM, tts: faultyTTS, tools: tools,
+		stt: dropout, llm: faultyLLM, tts: faultyTTS, tools: tools,
 		sttDescription: sttDesc,
 		llmDescription: agentDesc,
 		ttsDescription: ttsDesc,
 		forget:         forget,
 		closers:        closers,
 		faults: providerFaults{
-			stt: injectorOf(faultySTT),
-			llm: injectorOf(faultyLLM),
-			tts: injectorOf(faultyTTS),
+			stt:       injectorOf(faultySTT),
+			llm:       injectorOf(faultyLLM),
+			tts:       injectorOf(faultyTTS),
+			sttStream: dropout,
 		},
 	}
 	if p.faults.stt == nil || p.faults.llm == nil || p.faults.tts == nil {

@@ -43,6 +43,17 @@ type Provider struct {
 	LLMExtraLatencyMs float64
 	LLMErrorRate      float64
 	TTSExtraLatencyMs float64
+
+	// STTFailAfterMs kills the recognition stream once a call has carried this
+	// much audio, measured in audio consumed rather than wall-clock. Zero
+	// leaves streams alone.
+	//
+	// It is separate from STTErrorRate because the two failures look nothing
+	// alike. An error rate fails a stream as it opens, which is a provider
+	// that is unreachable; this fails one that was working, mid-utterance,
+	// with the caller still talking — and that is the failure a voice pipeline
+	// is actually asked about.
+	STTFailAfterMs float64
 }
 
 // Profile is a named scenario: one flag that sets up a whole demo beat.
@@ -85,11 +96,17 @@ var Profiles = map[string]Profile{
 			LLMExtraLatencyMs: 3000,
 		},
 	},
+	"stt-dropout": {
+		Name: "stt-dropout",
+		Description: "the recognizer dies three seconds into every call — " +
+			"the failure a voice pipeline is actually asked about",
+		Provider: Provider{STTFailAfterMs: 3000},
+	},
 }
 
 // ProfileNames lists the available profile names in a stable order.
 func ProfileNames() []string {
-	return []string{"clean", "mobile", "lossy-wan", "provider-degraded"}
+	return []string{"clean", "mobile", "lossy-wan", "provider-degraded", "stt-dropout"}
 }
 
 // LookupProfile resolves a profile by name.
@@ -139,6 +156,7 @@ func (p Provider) Validate() error {
 		{"STTExtraLatencyMs", p.STTExtraLatencyMs},
 		{"LLMExtraLatencyMs", p.LLMExtraLatencyMs},
 		{"TTSExtraLatencyMs", p.TTSExtraLatencyMs},
+		{"STTFailAfterMs", p.STTFailAfterMs},
 	} {
 		if f.val < 0 {
 			return fmt.Errorf("chaos: %s = %v, want >= 0", f.name, f.val)

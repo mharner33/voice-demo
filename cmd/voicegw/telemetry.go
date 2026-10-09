@@ -70,6 +70,15 @@ func (c *activeCall) emitTelemetry(reason string) {
 		c.root.SetAPMTag("call.pipeline_dropped", int64(c.dropped.Load()))
 		c.root.SetAPMTag("call.frames_returned", int64(c.egressFwd.Load()))
 		c.root.SetAPMTag("call.end_reason", reason)
+		if res.STTErr != nil {
+			// A tag rather than an errored root span. The call itself
+			// completed — the turns before the recognizer died really
+			// happened — but the trace has to be findable, and
+			// `@call.stt_error:*` in the trace list is what finds it. The
+			// Agent Observability workflow span *is* marked errored, since
+			// that is the span the failure belongs to.
+			c.root.SetAPMTag("call.stt_error", res.STTErr.Error())
+		}
 		c.root.SetAPMTag("call.signaled", c.signaled)
 		c.root.Finish(runErr)
 	}

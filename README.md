@@ -24,9 +24,9 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | 6 | LLM in the loop (real agent, tool definitions, cost, evaluations) | done |
 | 7 | Real Google STT/TTS | done |
 | 8 | Load generator, demo script, dashboard, monitors | done |
-| 9 | Demo polish | next |
+| 9 | Demo polish: runbook, dashboard tuning, failure rehearsal | done |
 
-The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
+All nine phases are complete. The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
 agent reply with a tool call, synthesized audio out — reported as APM traces, Agent
 Observability spans with token counts, cost and per-call evaluations, DogStatsD metrics and
 a correlated call log.
@@ -242,6 +242,36 @@ synthetic set out to listen to it:
 make fixtures
 ```
 
+### Rehearsing a failure
+
+The failure a voice pipeline is actually asked about is the recognizer that was working and
+then stopped, mid-utterance, with the caller still talking:
+
+```bash
+curl -X POST localhost:8080/chaos -d '{"profile":"stt-dropout"}'
+```
+
+```bash
+./bin/voicectl send -duration 8s
+```
+
+An eight-second call then produces two turns instead of four, with pristine transport
+figures and the reason in the call log:
+
+```
+stt_error         stt: the recognition stream failed 3s into the call: faults: injected provider error
+packets_rx  400   packets_lost  0   mos  4.41   turn_count  2
+```
+
+This is a different failure from an error rate, which fails a stream as it *opens* — a
+provider that never answered, against one that stopped answering. They need separate
+signals because they need separate fixes, and before phase 7 the second one was
+indistinguishable from a caller hanging up.
+
+[docs/demo-runbook.md](docs/demo-runbook.md) has the rest of the gallery: an unreachable
+recognizer, an agent failing every turn, a call with no signaling, and what each one looks
+like across the dashboard, the trace and the log.
+
 ### Changing conditions without restarting
 
 The gateway serves `/chaos` on `:8080`. Provider impairment is live-tunable, which is what
@@ -298,6 +328,23 @@ APM and the AI layer lives in Agent Observability.
 
 `CALLS`, `CONCURRENCY` and `BEAT_PAUSE` tune it. Raise `BEAT_PAUSE` for a customer session —
 Datadog's rollup makes a beat shorter than a minute hard to separate on a dashboard.
+
+### Running it for an audience
+
+[docs/demo-runbook.md](docs/demo-runbook.md) is the session script: the pre-flight that
+takes ten seconds, what to open in what order, what to point at and say for each beat, a
+rehearsed failure gallery with the output each failure actually produces, and a table of
+what to do when something breaks mid-session.
+
+The short version of the pre-flight, because it is the part worth never skipping:
+
+```bash
+./bin/voicectl send -duration 5s -save-reply /tmp/reply.wav
+```
+
+Four things have to be true and all four are in that output — the loss reconciles, the agent
+answered and called its tool, reply audio came back, and the printed trace ID opens in
+Datadog. If the trace is not there, nothing else will be either.
 
 ### SIP signaling logs
 

@@ -4,7 +4,9 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -194,4 +196,80 @@ func TestMonitorThresholdsMatchTheScriptedImpairment(t *testing.T) {
 	// makes two, so turns land near 6s.
 	check("provider-latency.json", func(v float64) bool { return v < 6000 },
 		"provider-degraded makes a tool-calling turn take about 6s")
+}
+
+// markerValue pulls the number out of a Datadog marker, which is written as a
+// line equation: "y = 3", "y > 4000".
+var markerValue = regexp.MustCompile(`y\s*[=<>]+\s*(-?[0-9.]+)`)
+
+// TestDashboardMarkersMatchMonitorThresholds keeps the two halves of the story
+// honest with each other.
+//
+// The dashboard draws threshold lines so a beat is unmistakable on screen, and
+// the monitors alert on thresholds of their own. If the two drift apart, a
+// graph shows a call sitting comfortably under its line while an alert fires
+// about it — and in a demo that discrepancy is the only thing anyone will
+// remember. Every line drawn has to be a threshold something actually alerts
+// on.
+func TestDashboardMarkersMatchMonitorThresholds(t *testing.T) {
+	thresholds := map[float64]bool{}
+	for _, m := range loadMonitors(t) {
+		for _, v := range m.Options.Thresholds {
+			thresholds[v] = true
+		}
+	}
+
+	data, err := os.ReadFile(dashboardPath)
+	if err != nil {
+		t.Fatalf("reading %s: %v", dashboardPath, err)
+	}
+
+	var dash struct {
+		Widgets []struct {
+			Definition struct {
+				Title   string `json:"title"`
+				Markers []struct {
+					Value string `json:"value"`
+					Label string `json:"label"`
+				} `json:"markers"`
+			} `json:"definition"`
+		} `json:"widgets"`
+	}
+	if err := json.Unmarshal(data, &dash); err != nil {
+		t.Fatal(err)
+	}
+
+	var drawn int
+	for _, w := range dash.Widgets {
+		for _, mk := range w.Definition.Markers {
+			match := markerValue.FindStringSubmatch(mk.Value)
+			if match == nil {
+				t.Errorf("%q: marker %q has no numeric value", w.Definition.Title, mk.Value)
+				continue
+			}
+			v, err := strconv.ParseFloat(match[1], 64)
+			if err != nil {
+				t.Errorf("%q: marker %q: %v", w.Definition.Title, mk.Value, err)
+				continue
+			}
+			drawn++
+			if !thresholds[v] {
+				t.Errorf("%q draws a line at %g, which no monitor alerts on; "+
+					"a graph and an alert disagreeing is worse than neither",
+					w.Definition.Title, v)
+			}
+			// The label names the monitor, so a viewer knows the line is an
+			// alert threshold rather than someone's opinion.
+			if !strings.Contains(strings.ToLower(mk.Label), "monitor") {
+				t.Errorf("%q: marker %q is labelled %q, which does not say it is "+
+					"a monitor threshold", w.Definition.Title, mk.Value, mk.Label)
+			}
+		}
+	}
+
+	if drawn == 0 {
+		t.Error("the dashboard draws no threshold lines, so nothing on it is " +
+			"visibly good or bad without reading the numbers")
+	}
+	t.Logf("%d threshold lines, all matching monitor thresholds", drawn)
 }

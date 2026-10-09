@@ -173,7 +173,8 @@ cannot degrade or even observe the impairment of a stream it only receives (find
 
 **Server-side (provider):**
 `--stt-extra-latency-ms`, `--stt-error-rate`, `--llm-extra-latency-ms`,
-`--llm-error-rate`, `--tts-extra-latency-ms`
+`--llm-error-rate`, `--tts-extra-latency-ms`, `--stt-fail-after` (mid-call stream death,
+which an error rate cannot express — finding 48)
 
 **Named profiles** so a demo beat is one flag:
 
@@ -183,13 +184,14 @@ cannot degrade or even observe the impairment of a stream it only receives (find
 | `mobile` | 1% loss, 30ms jitter |
 | `lossy-wan` | 5% burst loss, 80ms jitter, 2% reorder |
 | `provider-degraded` | STT +2s, 10% STT errors, LLM +3s |
+| `stt-dropout` | the recognition stream dies 3s into every call (finding 48) |
 
 ## 4. Build plan — 9 phases
 
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0 through 8 are complete, plus the control plane** (which was
+**Progress: all nine phases are complete, plus the control plane** (which was
 originally deferred to Appendix A as "real SIP signaling" but turned out to be load-bearing
 for four separate measurement problems — see findings 25-28). See
 [§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
@@ -394,11 +396,34 @@ loss reconciling on every one.
 The last row is the one that makes the whole design legible: a pristine network with a sick
 provider leaves every transport figure untouched and moves only the span durations.
 
-### Phase 9 — Demo polish (before the customer session)
+### Phase 9 — Demo polish (done)
 
-- README narrative: what to open, in what order, what to point at
-- Dashboard tuning so each chaos profile is unmistakable on screen
-- Failure-mode rehearsal: what the trace looks like when STT times out mid-call
+- [docs/demo-runbook.md](demo-runbook.md) — the session script: a ten-second pre-flight,
+  what to open in what order, what to point at and say per beat, the failure gallery, and a
+  table of what to do when something breaks mid-session. Every figure in it is measured
+  (finding 50).
+- **Dashboard tuning.** The beat row moved to the top, since it is the row a demo reads and
+  a dashboard whose first row does not state its own conditions produces unattributable
+  screenshots. Threshold lines now match the monitors exactly, with a test holding them
+  together (finding 49), and the y-axis ranges are pinned so two runs are comparable.
+- **A mid-call recognizer failure is now producible** — `internal/stt/dropout.go` and the
+  `stt-dropout` profile. The plan asked what the trace looks like when STT times out
+  mid-call, and the honest answer was that nothing in the system could make that happen
+  (finding 48).
+- The call's APM root span carries `call.stt_error` when a recognition stream died, so
+  `@call.stt_error:*` finds every affected trace without making the whole call an error.
+
+**Test:** `internal/stt/dropout_test.go` pins the behaviour that matters — exactly one error
+and it is last, hypotheses already produced survive, a call shorter than the fault point is
+untouched, the wrapper keeps draining audio after the recognizer is gone (a wrapper that
+stopped reading would stall the gateway's playout loop), the fault point is fixed for the
+duration of a call, and two identical runs fail identically. `cmd/voicegw/http_test.go`
+covers arming it over `/chaos` and the guarantee that a rejected request cannot leave a
+recognizer set to die. `internal/obs/monitors_test.go` holds the dashboard's threshold lines
+against the monitors' thresholds.
+
+Rehearsed against the real gateway rather than reasoned about: every row of the runbook's
+failure gallery is observed output.
 
 **UI is deliberately deferred.** CLI + Datadog dashboards are the interface for now; a web
 UI can be added later if the customer session calls for it.
@@ -839,6 +864,52 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     the client's declared profile since the phase-5 work (finding 24 anticipated exactly
     this), so the fix was to put it on `obs.CallTags` and use it. The dashboard gained a
     beat-comparison row split by it, and `$network_profile` as a template variable.
+
+48. **The plan asked for a trace of a mid-call STT timeout, and nothing could produce
+    one.** The fault injector decides a provider's fate when the stream *opens*, which was
+    deliberate — it keeps injected latency attributable to one span — but it only models a
+    provider that was never reachable. The failure a voice pipeline is actually asked about
+    is the recognizer that was working and then stopped, mid-utterance, with the caller
+    still talking. So phase 9 had to build it: `internal/stt/dropout.go`, wrapping any
+    Transcriber, with the fault point measured in *audio consumed* rather than wall-clock
+    for the same reason the mock recognizer is (finding 12) — a demo that failed at a
+    different point each run would be unrepeatable.
+
+    Two things about it were not obvious. The wrapper has to keep draining the caller's
+    audio after the recognizer is gone, because the gateway's playout loop hands every
+    frame to that channel and a wrapper that stopped reading would stall playout — which is
+    also exactly what happens to a caller's voice when the far end has stopped listening.
+    And the error and the provider's last hypothesis become ready at the same instant, so a
+    naive select kept the final transcript on some runs and dropped it on others; the
+    wrapper now delivers everything the provider already produced and reports the failure
+    after it, with a grace bound for a provider that will not wind down.
+
+    What the rehearsal then showed is the part worth saying out loud in a demo: an
+    eight-second call produced two turns instead of four, with `packets_rx=400`,
+    `packets_lost=0` and `mos=4.41` — pristine transport — and `stt_error` naming the
+    failure and where in the call it happened. But `mean_confidence` stayed at 0.95 and
+    `audio_quality` still said `clean`, because the turns that *did* complete were fine.
+    **None of the three evaluations catches a recognizer that stopped early.** What catches
+    it is the errored workflow span, `stt_error` in the log, and `voice.call.errors` tripping
+    the failed-turns monitor. That is an honest thing to tell an audience about what
+    evaluations are for: they grade the output that exists, not the output that never
+    happened.
+
+49. **A dashboard line and an alert threshold that disagree are worse than neither.** The
+    dashboard now draws its threshold lines at exactly the monitors' values, and a test
+    fails the build if a line is drawn that nothing alerts on, or if a line is labelled as
+    anything other than a monitor threshold. The failure mode this prevents is specific and
+    bad: a graph showing a call sitting comfortably under its line while an alert fires
+    about it, mid-demo, which is the only thing anyone in the room would remember
+    afterwards.
+
+50. **Every number in the runbook is measured, and that is the point of writing it last.**
+    A runbook of plausible figures is worse than no runbook, because the first number that
+    does not match is the moment the audience stops believing the rest. So each beat and
+    each failure in [docs/demo-runbook.md](demo-runbook.md) was run against the real
+    gateway and the observed output pasted in — which is also how finding 48's evaluation
+    gap was discovered, by reading what the call log actually said rather than what it was
+    expected to say.
 
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5

@@ -60,6 +60,11 @@ type chaosRequest struct {
 	LLMLatencyMs *float64 `json:"llm_latency_ms,omitempty"`
 	LLMErrorRate *float64 `json:"llm_error_rate,omitempty"`
 	TTSLatencyMs *float64 `json:"tts_latency_ms,omitempty"`
+
+	// STTFailAfterMs kills the recognition stream part way through a call,
+	// which is a different failure from an error rate: one is a provider that
+	// never answered, the other is one that stopped mid-utterance.
+	STTFailAfterMs *float64 `json:"stt_fail_after_ms,omitempty"`
 }
 
 // stageState reports one provider's impairment and what it has actually
@@ -68,6 +73,10 @@ type chaosRequest struct {
 type stageState struct {
 	LatencyMs float64 `json:"latency_ms"`
 	ErrorRate float64 `json:"error_rate"`
+
+	// FailAfterMs is set for the recognizer only, since it is the only
+	// streaming stage and so the only one with a middle to fail in.
+	FailAfterMs float64 `json:"fail_after_ms,omitempty"`
 
 	Calls  uint64 `json:"calls"`
 	Errors uint64 `json:"errors"`
@@ -120,9 +129,14 @@ func (a *chaosAPI) state() chaosState {
 			Errors:    st.Errors,
 		}
 	}
+	sttState := stage(a.faults.stt)
+	if a.faults.sttStream != nil {
+		sttState.FailAfterMs = float64(a.faults.sttStream.FailAfter().Milliseconds())
+	}
+
 	return chaosState{
 		Profile: a.profile.Get(),
-		STT:     stage(a.faults.stt),
+		STT:     sttState,
 		LLM:     stage(a.faults.llm),
 		TTS:     stage(a.faults.tts),
 		Note:    networkNote,
@@ -167,6 +181,9 @@ func (a *chaosAPI) apply(req chaosRequest) error {
 		LLMErrorRate:      a.faults.llm.Config().ErrorRate,
 		TTSExtraLatencyMs: float64(a.faults.tts.Config().ExtraLatency.Milliseconds()),
 	}
+	if a.faults.sttStream != nil {
+		pv.STTFailAfterMs = float64(a.faults.sttStream.FailAfter().Milliseconds())
+	}
 	name := a.profile.Get()
 
 	if req.Profile != nil {
@@ -190,6 +207,7 @@ func (a *chaosAPI) apply(req chaosRequest) error {
 		{req.LLMLatencyMs, &pv.LLMExtraLatencyMs},
 		{req.LLMErrorRate, &pv.LLMErrorRate},
 		{req.TTSLatencyMs, &pv.TTSExtraLatencyMs},
+		{req.STTFailAfterMs, &pv.STTFailAfterMs},
 	} {
 		if o.val != nil {
 			*o.dst = *o.val
@@ -228,6 +246,11 @@ func (a *chaosAPI) apply(req chaosRequest) error {
 		if err := s.inj.SetConfig(s.cfg); err != nil {
 			return err
 		}
+	}
+	// Armed last, and only once everything else has been accepted, so a
+	// rejected request cannot leave the recognizer set to die mid-call.
+	if a.faults.sttStream != nil {
+		a.faults.sttStream.SetFailAfter(ms(pv.STTFailAfterMs))
 	}
 
 	a.profile.Set(name)
