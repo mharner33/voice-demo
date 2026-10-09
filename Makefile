@@ -7,6 +7,11 @@ PKG   := github.com/mharner33/voice-demo
 COMPOSE := $(shell command -v podman-compose >/dev/null 2>&1 && echo podman-compose || echo "podman compose")
 COMPOSE_FILE := deploy/compose.yml
 
+# Where the demo targets expect to find a running gateway.
+DEMO_CONTROL ?= 127.0.0.1:50051
+DEMO_HTTP    ?= 127.0.0.1:8080
+SIP_LOG      ?= /tmp/sip_signaling.log
+
 .DEFAULT_GOAL := help
 
 ## help: list targets
@@ -83,8 +88,35 @@ dashboard:
 	  -H "DD-APPLICATION-KEY: $$DD_APP_KEY" \
 	  -d @deploy/datadog/dashboard.json | python3 -m json.tool | head -20
 
-## demo: scripted demo run (phase 8)
+## demo: scripted demo run — four beats against a gateway you already started
 demo:
-	@echo "not implemented until phase 8"
+	CONTROL=$(DEMO_CONTROL) HTTP=$(DEMO_HTTP) deploy/demo.sh
 
-.PHONY: help build test test-integration cover fuzz lint tidy proto up down logs agent-status dashboard demo
+## load: place 50 calls against a running gateway
+load:
+	./bin/voicectl load -control $(DEMO_CONTROL) -calls 50 -concurrency 10 -profile clean,mobile,lossy-wan
+
+## fixtures: write the built-in synthetic call audio as WAV files
+fixtures:
+	./bin/voicectl fixtures -dir testdata/fixtures
+
+## sip-logs: reconstruct SIP signaling from the gateway's call log
+sip-logs:
+	@test -n "$(CALL_LOG)" || { echo "set CALL_LOG=<the gateway's -call-log path>"; exit 1; }
+	python3 deploy/sip/sip_log_generator.py --call-log $(CALL_LOG) --out $(SIP_LOG) --follow
+
+## monitors: upload deploy/datadog/monitors/*.json (needs DD_API_KEY and DD_APP_KEY)
+monitors:
+	@test -n "$$DD_API_KEY" || { echo "DD_API_KEY is not set"; exit 1; }
+	@test -n "$$DD_APP_KEY" || { echo "DD_APP_KEY is not set"; exit 1; }
+	@for f in deploy/datadog/monitors/*.json; do \
+	  echo "uploading $$f"; \
+	  curl -sS -X POST "https://api.$${DD_SITE:-datadoghq.com}/api/v1/monitor" \
+	    -H "Content-Type: application/json" \
+	    -H "DD-API-KEY: $$DD_API_KEY" \
+	    -H "DD-APPLICATION-KEY: $$DD_APP_KEY" \
+	    -d @$$f | python3 -c 'import json,sys; d=json.load(sys.stdin); print("  ->", d.get("id", d))'; \
+	done
+
+.PHONY: help build test test-integration cover fuzz lint tidy proto up down logs \
+	agent-status dashboard monitors demo load fixtures sip-logs

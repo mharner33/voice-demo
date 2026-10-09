@@ -128,6 +128,36 @@ func (n Network) Validate() error {
 	return nil
 }
 
+// Validate rejects provider settings that cannot be applied, which matters
+// most for the live /chaos endpoint: a bad value posted mid-demo has to be
+// refused with an explanation rather than silently clamped.
+func (p Provider) Validate() error {
+	for _, f := range []struct {
+		name string
+		val  float64
+	}{
+		{"STTExtraLatencyMs", p.STTExtraLatencyMs},
+		{"LLMExtraLatencyMs", p.LLMExtraLatencyMs},
+		{"TTSExtraLatencyMs", p.TTSExtraLatencyMs},
+	} {
+		if f.val < 0 {
+			return fmt.Errorf("chaos: %s = %v, want >= 0", f.name, f.val)
+		}
+	}
+	for _, f := range []struct {
+		name string
+		val  float64
+	}{
+		{"STTErrorRate", p.STTErrorRate},
+		{"LLMErrorRate", p.LLMErrorRate},
+	} {
+		if f.val < 0 || f.val > 1 {
+			return fmt.Errorf("chaos: %s = %v, want 0-1", f.name, f.val)
+		}
+	}
+	return nil
+}
+
 // IsClean reports whether this config leaves traffic untouched, letting callers
 // skip the impairment path entirely.
 func (n Network) IsClean() bool {

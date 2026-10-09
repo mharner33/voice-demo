@@ -29,12 +29,22 @@ type Config struct {
 	ErrorRate float64
 	// Seed makes the failure pattern reproducible.
 	Seed int64
+
+	// Tunable keeps the wrapper in place even when the config is clean, so the
+	// live /chaos endpoint has an injector to retune.
+	//
+	// Without it a gateway started clean has nothing to turn on: WithFaults
+	// returns the provider unwrapped, and the whole point of the endpoint is
+	// flipping conditions mid-demo with a dashboard on screen. The cost is one
+	// mutex-guarded branch per provider call on the healthy path.
+	Tunable bool
 }
 
 // IsClean reports whether this config leaves calls untouched, letting callers
-// skip wrapping entirely.
+// skip wrapping entirely. A tunable config is never clean, because the
+// wrapper has to survive to be retuned.
 func (c Config) IsClean() bool {
-	return c.ExtraLatency <= 0 && c.ErrorRate <= 0
+	return !c.Tunable && c.ExtraLatency <= 0 && c.ErrorRate <= 0
 }
 
 // Validate rejects nonsense early, so a bad flag fails at startup rather than

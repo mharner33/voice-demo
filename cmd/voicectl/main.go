@@ -1,6 +1,7 @@
 // Command voicectl is the client: it sets up a call over the gateway's control
 // plane, sends audio as RTP/G.711 while optionally impairing the stream, tears
-// the call down, and receives the agent's spoken reply.
+// the call down, and receives the agent's spoken reply. `voicectl load` does
+// the same thing many times at once.
 //
 // File and synthetic tone sources are supported. Microphone capture will be
 // host-only when it arrives, since macOS containers cannot reach the
@@ -15,14 +16,13 @@ import (
 	"net"
 	"os"
 	"os/signal"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/mharner33/voice-demo/internal/chaos"
 	"github.com/mharner33/voice-demo/internal/codec"
-	"github.com/mharner33/voice-demo/internal/control"
+	"github.com/mharner33/voice-demo/internal/loadgen"
 	"github.com/mharner33/voice-demo/internal/rtp"
 )
 
@@ -37,6 +37,14 @@ func main() {
 	case "send":
 		if err := runSend(os.Args[2:]); err != nil {
 			log.Fatalf("voicectl send: %v", err)
+		}
+	case "load":
+		if err := runLoad(os.Args[2:]); err != nil {
+			log.Fatalf("voicectl load: %v", err)
+		}
+	case "fixtures":
+		if err := runFixtures(os.Args[2:]); err != nil {
+			log.Fatalf("voicectl fixtures: %v", err)
 		}
 	case "profiles":
 		listProfiles()
@@ -54,9 +62,11 @@ func usage() {
 
 Usage:
   voicectl send [flags]     send audio to a gateway over RTP
+  voicectl load [flags]     place many calls at once
+  voicectl fixtures [flags] write the built-in synthetic call audio as WAV files
   voicectl profiles         list the named impairment profiles
 
-Run "voicectl send -h" for the send flags.
+Run "voicectl send -h" or "voicectl load -h" for their flags.
 `)
 }
 
@@ -72,6 +82,55 @@ func listProfiles() {
 				"", n.LossPct, n.LossBurst, n.JitterMs, n.LatencyMs, n.ReorderPct, n.DupPct)
 		}
 	}
+}
+
+// networkFlags are the per-knob overrides shared by send and load.
+type networkFlags struct {
+	lossPct    *float64
+	jitterMs   *float64
+	latencyMs  *float64
+	reorderPct *float64
+	dupPct     *float64
+}
+
+func registerNetworkFlags(fs *flag.FlagSet) networkFlags {
+	return networkFlags{
+		lossPct:    fs.Float64("loss-pct", -1, "override packet loss percentage"),
+		jitterMs:   fs.Float64("jitter-ms", -1, "override jitter in ms"),
+		latencyMs:  fs.Float64("latency-ms", -1, "override added latency in ms"),
+		reorderPct: fs.Float64("reorder-pct", -1, "override reorder percentage"),
+		dupPct:     fs.Float64("dup-pct", -1, "override duplication percentage"),
+	}
+}
+
+// apply overlays the overrides on a profile's network settings. A negative flag
+// means "not set", so zero stays usable as a real override — turning loss off
+// on a lossy profile has to be expressible.
+func (f networkFlags) apply(n chaos.Network) (chaos.Network, error) {
+	for _, o := range []struct {
+		val float64
+		dst *float64
+	}{
+		{*f.lossPct, &n.LossPct},
+		{*f.jitterMs, &n.JitterMs},
+		{*f.latencyMs, &n.LatencyMs},
+		{*f.reorderPct, &n.ReorderPct},
+		{*f.dupPct, &n.DupPct},
+	} {
+		if o.val >= 0 {
+			*o.dst = o.val
+		}
+	}
+	return n, n.Validate()
+}
+
+// parseCodec resolves the codec flag.
+func parseCodec(s string) (codec.Codec, error) {
+	c := codec.Codec(strings.ToUpper(s))
+	if c != codec.PCMU && c != codec.PCMA {
+		return "", fmt.Errorf("codec must be PCMU or PCMA, got %q", s)
+	}
+	return c, nil
 }
 
 func runSend(args []string) error {
@@ -94,42 +153,23 @@ func runSend(args []string) error {
 		pace      = fs.Duration("pace", codec.FrameDuration, "interval between frames; below 20ms compresses the call but inflates measured jitter")
 		seed      = fs.Int64("seed", time.Now().UnixNano(), "impairment RNG seed; fix it to make a run reproducible")
 
-		// Per-knob overrides, applied on top of the profile.
-		lossPct    = fs.Float64("loss-pct", -1, "override packet loss percentage")
-		jitterMs   = fs.Float64("jitter-ms", -1, "override jitter in ms")
-		latencyMs  = fs.Float64("latency-ms", -1, "override added latency in ms")
-		reorderPct = fs.Float64("reorder-pct", -1, "override reorder percentage")
-		dupPct     = fs.Float64("dup-pct", -1, "override duplication percentage")
+		netFlags = registerNetworkFlags(fs)
 	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 
-	c := codec.Codec(strings.ToUpper(*codecArg))
-	if c != codec.PCMU && c != codec.PCMA {
-		return fmt.Errorf("codec must be PCMU or PCMA, got %q", *codecArg)
+	c, err := parseCodec(*codecArg)
+	if err != nil {
+		return err
 	}
 
 	prof, err := chaos.LookupProfile(*profile)
 	if err != nil {
 		return err
 	}
-	net0 := prof.Network
-	for _, o := range []struct {
-		val float64
-		dst *float64
-	}{
-		{*lossPct, &net0.LossPct},
-		{*jitterMs, &net0.JitterMs},
-		{*latencyMs, &net0.LatencyMs},
-		{*reorderPct, &net0.ReorderPct},
-		{*dupPct, &net0.DupPct},
-	} {
-		if o.val >= 0 {
-			*o.dst = o.val
-		}
-	}
-	if err := net0.Validate(); err != nil {
+	network, err := netFlags.apply(prof.Network)
+	if err != nil {
 		return err
 	}
 
@@ -137,23 +177,7 @@ func runSend(args []string) error {
 	if err != nil {
 		return err
 	}
-	if audio.SampleRate != codec.SampleRate8k {
-		resampled, err := codec.Resample(audio, codec.SampleRate8k)
-		if err != nil {
-			return fmt.Errorf("source is %d Hz and cannot be resampled to 8 kHz: %w",
-				audio.SampleRate, err)
-		}
-		log.Printf("resampled %d Hz -> 8 kHz", audio.SampleRate)
-		audio = resampled
-	}
-
-	pcmFrames := codec.FramePCM(audio.PCM)
-	payloads := make([][]byte, len(pcmFrames))
-	for i, f := range pcmFrames {
-		payloads[i] = c.Encode(f)
-	}
-
-	ssrc, err := rtp.NewSSRC()
+	payloads, err := encodeForWire(audio, c)
 	if err != nil {
 		return err
 	}
@@ -161,72 +185,82 @@ func runSend(args []string) error {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
+	if *noSignal {
+		mediaAddr := *to
+		if mediaAddr == "" {
+			mediaAddr = "127.0.0.1:5004"
+		}
+		log.Printf("sending without signaling; the gateway cannot detect trailing " +
+			"loss or send a reply")
+		return sendUnsignaled(ctx, mediaAddr, payloads, c, network, *seed, *pace, *profile)
+	}
+
 	// Listen for the agent's reply before signaling, so the port can be
 	// declared at call setup. The gateway sends audio to the address the media
 	// came from combined with this port.
 	var listener *replyListener
-	if !*noReply && !*noSignal {
+	if !*noReply {
 		listener, err = newReplyListener(*replyPort, c)
 		if err != nil {
 			return err
 		}
 		defer listener.Close()
 	}
-
-	mediaAddr := *to
-	var (
-		ctrl   *control.Client
-		callID string
-	)
-
-	if *noSignal {
-		if mediaAddr == "" {
-			mediaAddr = "127.0.0.1:5004"
-		}
-		log.Printf("sending without signaling; the gateway cannot detect trailing " +
-			"loss or send a reply")
-	} else {
-		ctrl, err = control.Dial(*ctrlAddr)
-		if err != nil {
-			return err
-		}
-		defer ctrl.Close()
-
-		returnPort := 0
-		if listener != nil {
-			returnPort = listener.Port()
-		}
-
-		setupCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
-		res, err := ctrl.StartCall(setupCtx, control.StartRequest{
-			From:           *from,
-			To:             *callee,
-			Codec:          c,
-			SSRC:           ssrc,
-			ReturnPort:     returnPort,
-			NetworkProfile: *profile,
-		})
-		cancel()
-		if err != nil {
-			return err
-		}
-		callID = res.CallID
-
-		// The gateway answers with where to send media, which is the whole
-		// point of negotiating rather than assuming a port.
-		if mediaAddr == "" {
-			host, _, splitErr := net.SplitHostPort(*ctrlAddr)
-			if splitErr != nil {
-				return fmt.Errorf("cannot derive the media host from %q: %w", *ctrlAddr, splitErr)
-			}
-			mediaAddr = net.JoinHostPort(host, strconv.Itoa(res.MediaPort))
-		}
-
-		log.Printf("call %s established: media to %s, codec %s", res.CallID, mediaAddr, res.Codec)
-		if res.TraceID != "" {
-			log.Printf("call %s trace: %s", res.CallID, res.TraceID)
-		}
+	returnPort := 0
+	if listener != nil {
+		returnPort = listener.Port()
 	}
+
+	caller, err := loadgen.Dial(*ctrlAddr)
+	if err != nil {
+		return err
+	}
+	defer caller.Close()
+
+	out, placeErr := caller.Place(ctx, loadgen.Spec{
+		From:       *from,
+		To:         *callee,
+		Codec:      c,
+		Profile:    *profile,
+		Network:    network,
+		Seed:       *seed,
+		Frames:     payloads,
+		Pace:       *pace,
+		ReturnPort: returnPort,
+		MediaAddr:  *to,
+		OnSetup: func(info loadgen.SetupInfo) {
+			log.Printf("call %s established: media to %s, codec %s",
+				info.CallID, info.MediaAddr, info.Codec)
+			if info.TraceID != "" {
+				log.Printf("call %s trace: %s", info.CallID, info.TraceID)
+			}
+			log.Printf("sending %d frames (%.1fs of %s audio) as ssrc=%#08x, profile=%s, seed=%d",
+				len(payloads), audio.Duration(), c, info.SSRC, *profile, *seed)
+		},
+	})
+	if placeErr != nil && out.CallID == "" {
+		// Nothing was established, so there is nothing to reconcile.
+		return placeErr
+	}
+
+	st := out.Sent
+	log.Printf("sent %d packets in %s (offered %d, dropped %d, duplicated %d, delayed %d, write errors %d)",
+		st.PacketsSent, out.Elapsed.Round(time.Millisecond), st.FramesOffered,
+		st.Dropped, st.Duplicated, st.Delayed, st.WriteErrors)
+
+	reportSummary(out, listener, *saveReply)
+
+	if placeErr != nil && ctx.Err() == nil {
+		return placeErr
+	}
+	return nil
+}
+
+// sendUnsignaled is the before picture: RTP from an SSRC the gateway never
+// heard about. It keeps working so the contrast stays demonstrable — no
+// trailing-loss accounting, no reply audio, nothing to reconcile against.
+func sendUnsignaled(ctx context.Context, mediaAddr string, payloads [][]byte,
+	c codec.Codec, network chaos.Network, seed int64, pace time.Duration, profile string) error {
 
 	conn, err := net.Dial("udp", mediaAddr)
 	if err != nil {
@@ -234,7 +268,11 @@ func runSend(args []string) error {
 	}
 	defer conn.Close()
 
-	imp, err := chaos.NewImpairer(net0, *seed)
+	ssrc, err := rtp.NewSSRC()
+	if err != nil {
+		return err
+	}
+	imp, err := chaos.NewImpairer(network, seed)
 	if err != nil {
 		return err
 	}
@@ -243,45 +281,18 @@ func runSend(args []string) error {
 		return err
 	}
 
-	log.Printf("sending %d frames (%.1fs of %s audio) to %s as ssrc=%#08x, profile=%s, seed=%d",
-		len(payloads), audio.Duration(), c, mediaAddr, ssrc, *profile, *seed)
+	log.Printf("sending %d frames to %s as ssrc=%#08x, profile=%s, seed=%d",
+		len(payloads), mediaAddr, ssrc, profile, seed)
 
 	start := time.Now()
-	streamErr := sender.Stream(ctx, payloads, *pace)
+	streamErr := sender.Stream(ctx, payloads, pace)
 	sender.Drain()
-	elapsed := time.Since(start)
+	_ = sender.Close()
 
 	st := sender.Stats()
 	log.Printf("sent %d packets in %s (offered %d, dropped %d, duplicated %d, delayed %d, write errors %d)",
-		st.PacketsSent, elapsed.Round(time.Millisecond), st.FramesOffered,
+		st.PacketsSent, time.Since(start).Round(time.Millisecond), st.FramesOffered,
 		st.Dropped, st.Duplicated, st.Delayed, st.WriteErrors)
-
-	if ctrl != nil && callID != "" {
-		// Teardown carries the sender's own accounting, including both ends of
-		// the sequence range it emitted. Those are what let the gateway
-		// account for loss at the edges of the stream, which it cannot
-		// otherwise see: nothing later reveals a trailing gap, and a dropped
-		// first packet makes it start counting one packet in.
-		firstSeq, finalSeq, haveRange := sender.SeqRange()
-
-		byeCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		sum, err := ctrl.EndCall(byeCtx, callID, control.SenderReport{
-			FramesOffered:  st.FramesOffered,
-			PacketsSent:    st.PacketsSent,
-			PacketsDropped: st.Dropped,
-			FirstSequence:  firstSeq,
-			FinalSequence:  finalSeq,
-			HaveRange:      haveRange,
-			Reason:         endReason(streamErr, ctx),
-		})
-		cancel()
-		if err != nil {
-			return err
-		}
-		reportSummary(callID, st, sum, listener, *saveReply, c)
-	} else if listener != nil {
-		listener.Close()
-	}
 
 	if streamErr != nil && ctx.Err() == nil {
 		return streamErr
@@ -289,23 +300,12 @@ func runSend(args []string) error {
 	return nil
 }
 
-func endReason(streamErr error, ctx context.Context) string {
-	switch {
-	case ctx.Err() != nil:
-		return "cancelled"
-	case streamErr != nil:
-		return "error"
-	default:
-		return "normal"
-	}
-}
-
 // reportSummary prints the two sides' accounting next to each other. Agreement
 // between them is the evidence that the loss figures mean something.
-func reportSummary(callID string, sent rtp.SenderStats, sum control.CallSummary,
-	listener *replyListener, savePath string, c codec.Codec) {
+func reportSummary(out loadgen.Outcome, listener *replyListener, savePath string) {
+	sent, sum := out.Sent, out.Summary
 
-	fmt.Printf("\ncall %s\n", callID)
+	fmt.Printf("\ncall %s\n", out.CallID)
 	fmt.Printf("  sender:   offered=%d sent=%d dropped=%d\n",
 		sent.FramesOffered, sent.PacketsSent, sent.Dropped)
 	fmt.Printf("  gateway:  received=%d expected=%d lost=%d (%.2f%%) jitter=%.1fms mos=%.2f\n",
@@ -316,7 +316,7 @@ func reportSummary(callID string, sent rtp.SenderStats, sum control.CallSummary,
 	// reached the gateway; without it the gateway undercounts by however many
 	// packets were lost after the last one that arrived.
 	switch {
-	case sum.PacketsLost == sent.Dropped:
+	case out.LossReconciles():
 		fmt.Printf("  loss reconciles exactly: the gateway measured all %d dropped packets\n",
 			sent.Dropped)
 	default:
@@ -334,6 +334,9 @@ func reportSummary(callID string, sent rtp.SenderStats, sum control.CallSummary,
 	}
 	if sum.TraceID != "" {
 		fmt.Printf("  trace:    %s\n", sum.TraceID)
+	}
+	if out.Err != nil {
+		fmt.Printf("  error:    %v\n", out.Err)
 	}
 
 	if listener == nil {
@@ -385,4 +388,19 @@ func loadAudio(file string, toneHz float64, dur time.Duration) (codec.Audio, err
 	}
 	log.Printf("loaded %s: %.2fs at %d Hz", file, audio.Duration(), audio.SampleRate)
 	return audio, nil
+}
+
+// encodeForWire resamples to the telephony rate if needed and compands the
+// audio into 20 ms G.711 frames.
+func encodeForWire(audio codec.Audio, c codec.Codec) ([][]byte, error) {
+	if audio.SampleRate != codec.SampleRate8k {
+		resampled, err := codec.Resample(audio, codec.SampleRate8k)
+		if err != nil {
+			return nil, fmt.Errorf("source is %d Hz and cannot be resampled to 8 kHz: %w",
+				audio.SampleRate, err)
+		}
+		log.Printf("resampled %d Hz -> 8 kHz", audio.SampleRate)
+		audio = resampled
+	}
+	return loadgen.Fixture{Audio: audio}.Payloads(c), nil
 }

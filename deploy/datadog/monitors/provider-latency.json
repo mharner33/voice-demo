@@ -1,0 +1,15 @@
+{
+  "name": "[voice-demo] The agent is too slow to answer a phone call",
+  "type": "query alert",
+  "query": "avg(last_5m):p95:voice.llm.latency_ms{env:demo} > 4000",
+  "message": "The 95th-percentile agent turn is taking more than four seconds, which on a voice channel is dead air the caller cannot interrupt.\n\nThis fires for provider problems, not network ones: a lossy network degrades the transcript but does not slow the model down. Check whether the network panels are clean — if they are, this is the provider, and `voice.stt.first_partial_ms` will usually be elevated with it.\n\nA turn that calls a tool legitimately costs two model round trips, so a jump to roughly double the normal figure is tool use rather than a sick provider. The per-round spans in Agent Observability distinguish the two.\n\nThis monitor is what the scripted demo's provider-degraded beat is built to trip.\n\n@slack-voice-demo",
+  "tags": ["service:voicegw", "env:demo", "team:voice-demo", "layer:ai"],
+  "options": {
+    "thresholds": { "critical": 4000, "warning": 2000 },
+    "notify_no_data": false,
+    "renotify_interval": 0,
+    "include_tags": true,
+    "new_group_delay": 60,
+    "evaluation_delay": 60
+  }
+}

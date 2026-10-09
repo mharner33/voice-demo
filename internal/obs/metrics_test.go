@@ -14,6 +14,7 @@ var testTags = CallTags{
 	CallID:          "c-deadbeef",
 	Codec:           "PCMU",
 	ProviderProfile: "provider-degraded",
+	NetworkProfile:  "lossy-wan",
 	STTProvider:     "mock",
 	LLMProvider:     "mock",
 	TTSProvider:     "mock",
@@ -41,6 +42,10 @@ func TestCallTagsContent(t *testing.T) {
 	}
 	for _, want := range []string{
 		"codec:PCMU", "provider_profile:provider-degraded",
+		// The client's declared profile is what the dashboard's beat row
+		// splits on, so a run without it would separate the demo's beats only
+		// by time.
+		"network_profile:lossy-wan",
 		"stt_provider:mock", "llm_provider:mock", "tts_provider:mock",
 	} {
 		if !got[want] {

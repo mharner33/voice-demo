@@ -109,6 +109,16 @@ type CallTags struct {
 	// call setup.
 	ProviderProfile string
 
+	// NetworkProfile is what the *client* declared it was doing to the stream,
+	// delivered at call setup. It is the tag the scripted demo's beats are
+	// told apart by: without it a dashboard can only separate beats by time,
+	// and "the numbers changed around 14:32" is a much weaker claim than
+	// "lossy-wan loses 5% and clean loses none, side by side".
+	//
+	// Empty for an unsignaled call, which cannot report one, and omitted from
+	// the tag set rather than guessed at.
+	NetworkProfile string
+
 	STTProvider string
 	LLMProvider string
 	TTSProvider string
@@ -121,7 +131,7 @@ type CallTags struct {
 // explode and the queries slow. The call ID lives on the spans and in the call
 // log, which is where a single call is looked up anyway.
 func (t CallTags) Slice() []string {
-	tags := make([]string, 0, 5)
+	tags := make([]string, 0, 6)
 	add := func(k, v string) {
 		if v != "" {
 			tags = append(tags, k+":"+v)
@@ -129,6 +139,7 @@ func (t CallTags) Slice() []string {
 	}
 	add("codec", t.Codec)
 	add("provider_profile", t.ProviderProfile)
+	add("network_profile", t.NetworkProfile)
 	add("stt_provider", t.STTProvider)
 	add("llm_provider", t.LLMProvider)
 	add("tts_provider", t.TTSProvider)

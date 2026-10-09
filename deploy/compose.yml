@@ -46,6 +46,9 @@ services:
       # The call log goes to stdout so the agent collects it from the container
       # log stream, with no file to mount.
       VOICE_CALL_LOG: "-"
+      # The live /chaos endpoint, so a demo can change provider conditions
+      # without restarting the container and clearing the dashboard.
+      VOICE_HTTP_ADDR: ":8080"
     volumes:
       # drop a GCP service-account JSON here for -real-stt/-real-tts; the dir
       # is gitignored

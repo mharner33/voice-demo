@@ -1,0 +1,15 @@
+{
+  "name": "[voice-demo] Calls are producing failed turns",
+  "type": "query alert",
+  "query": "sum(last_5m):sum:voice.call.errors{env:demo}.as_count() > 0",
+  "message": "At least one turn in the last five minutes failed outright: a provider call errored, or the agent produced nothing to say.\n\nA failed turn is worse than a slow one. The caller hears silence, and silence is the one failure mode a phone line must never have — so this monitor has no warning threshold and no tolerance. One is too many.\n\nThe call log's `turns[].error` field names the stage that failed, and the APM trace for the same `call_id` shows where in the pipeline it stopped. A turn that failed with an injected fault is expected during the demo's provider-degraded beat, where the STT error rate is set to 10%.\n\n@slack-voice-demo",
+  "tags": ["service:voicegw", "env:demo", "team:voice-demo", "layer:pipeline"],
+  "options": {
+    "thresholds": { "critical": 0 },
+    "notify_no_data": false,
+    "renotify_interval": 0,
+    "include_tags": true,
+    "new_group_delay": 60,
+    "evaluation_delay": 60
+  }
+}

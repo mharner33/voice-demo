@@ -151,8 +151,10 @@ func TestDashboardTemplateVariablesAreUsed(t *testing.T) {
 			// Unified service tags, applied to every metric.
 		default:
 			tagged := false
+			// Every field set, so the check is against the tags this code
+			// can emit rather than the ones a past version happened to.
 			for _, tag := range (CallTags{
-				Codec: "x", ProviderProfile: "x",
+				Codec: "x", ProviderProfile: "x", NetworkProfile: "x",
 				STTProvider: "x", LLMProvider: "x", TTSProvider: "x",
 			}).Slice() {
 				if strings.HasPrefix(tag, tv.Prefix+":") {

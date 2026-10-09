@@ -9,6 +9,7 @@ require (
 	github.com/DataDog/dd-trace-go/v2 v2.11.1
 	github.com/anthropics/anthropic-sdk-go v1.79.1
 	github.com/pion/rtp v1.10.5
+	go.uber.org/goleak v1.3.0
 	google.golang.org/api v0.287.1
 	google.golang.org/grpc v1.84.0
 	google.golang.org/protobuf v1.36.12-0.20260116114154-8c4c4ae446ca

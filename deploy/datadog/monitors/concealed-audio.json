@@ -1,0 +1,15 @@
+{
+  "name": "[voice-demo] The recognizer is hearing invented audio",
+  "type": "query alert",
+  "query": "avg(last_5m):p95:voice.call.concealed_pct{env:demo} > 10",
+  "message": "More than a tenth of the audio reaching the recognizer was synthesized by the jitter buffer rather than received from the caller.\n\nThis is the metric that connects the transport layer to the AI layer, and it is the one worth alerting on: packet loss on its own is a network fact, but concealed audio is the mechanism by which that fact becomes a worse transcript. Expect `transcript_confidence` in the Agent Observability Evaluations view to be down by a similar proportion, and expect `audio_quality` to be reporting `degraded` or `poor`.\n\nTwo causes to separate: real network loss (`voice.rtp.loss_pct` is high too) or a jitter buffer too shallow for the jitter it is seeing (`voice.jbuf.late_drops` is high while loss is low). The second is self-inflicted and is fixed with `-jbuf-target`.\n\n@slack-voice-demo",
+  "tags": ["service:voicegw", "env:demo", "team:voice-demo", "layer:ai"],
+  "options": {
+    "thresholds": { "critical": 10, "warning": 4 },
+    "notify_no_data": false,
+    "renotify_interval": 0,
+    "include_tags": true,
+    "new_group_delay": 60,
+    "evaluation_delay": 60
+  }
+}

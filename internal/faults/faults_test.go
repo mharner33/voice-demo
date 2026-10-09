@@ -288,3 +288,42 @@ func TestConcurrentUse(t *testing.T) {
 	}
 	<-done
 }
+
+// A gateway started with no impairment still has to be impairable, or the live
+// /chaos endpoint would have nothing to retune and a demo could not flip
+// conditions with a dashboard already on screen.
+func TestTunableConfigIsNeverClean(t *testing.T) {
+	if (Config{Tunable: true}).IsClean() {
+		t.Error("a tunable zero config reports itself clean; the wrapper would be dropped")
+	}
+	if !(Config{}).IsClean() {
+		t.Error("a plain zero config is not clean; the healthy path would pay for nothing")
+	}
+}
+
+// A tunable injector starts as a no-op and takes effect once retuned.
+func TestTunableInjectorStartsClean(t *testing.T) {
+	inj, err := New(Config{Tunable: true})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	var slept time.Duration
+	inj.Sleeper = func(_ context.Context, d time.Duration) error { slept += d; return nil }
+
+	if err := inj.Apply(context.Background()); err != nil {
+		t.Errorf("a clean tunable injector failed a call: %v", err)
+	}
+	if slept != 0 {
+		t.Errorf("a clean tunable injector waited %v", slept)
+	}
+
+	if err := inj.SetConfig(Config{ExtraLatency: 2 * time.Second, Tunable: true}); err != nil {
+		t.Fatalf("SetConfig: %v", err)
+	}
+	if err := inj.Apply(context.Background()); err != nil {
+		t.Errorf("Apply after retuning: %v", err)
+	}
+	if slept != 2*time.Second {
+		t.Errorf("waited %v after retuning, want 2s", slept)
+	}
+}

@@ -106,7 +106,8 @@ func newActiveCall(params control.CallParams, jbCfg jbuf.Config, p providers,
 	tags := obs.CallTags{
 		CallID:          params.CallID,
 		Codec:           string(params.Codec),
-		ProviderProfile: tel.profile,
+		ProviderProfile: tel.profile.Get(),
+		NetworkProfile:  params.NetworkProfile,
 		STTProvider:     p.stt.Info().Provider,
 		LLMProvider:     p.llm.Info().Provider,
 		TTSProvider:     p.tts.Info().Provider,
@@ -131,7 +132,7 @@ func newActiveCall(params control.CallParams, jbCfg jbuf.Config, p providers,
 		"call_id":          params.CallID,
 		"ssrc":             fmt.Sprintf("%#08x", params.SSRC),
 		"codec":            string(params.Codec),
-		"provider_profile": tel.profile,
+		"provider_profile": tel.profile.Get(),
 		"signaled":         fmt.Sprintf("%v", signaled),
 	}
 	if params.NetworkProfile != "" {

@@ -131,7 +131,7 @@ func (c *activeCall) writeCallLog(reason string, ns rtp.Stats, jb jbuf.Stats,
 		CallID:  c.id,
 		SSRC:    fmt.Sprintf("%#08x", c.params.SSRC),
 		Codec:   c.tags.Codec,
-		Profile: c.tel.profile,
+		Profile: c.tel.profile.Get(),
 
 		From:           c.params.From,
 		To:             c.params.To,

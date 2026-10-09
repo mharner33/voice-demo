@@ -1,0 +1,15 @@
+{
+  "name": "[voice-demo] Call quality (MOS) has degraded",
+  "type": "query alert",
+  "query": "avg(last_5m):p50:voice.mos.estimate{env:demo} < 3.0",
+  "message": "The median estimated MOS across calls has fallen below 3.0, which is the point where a listener describes the line as poor rather than merely imperfect.\n\nMOS here is a simplified ITU E-model over measured loss and latency, so it moves for a reason that is visible one panel away: check `voice.rtp.loss_pct` and `voice.rtp.jitter_ms` split by `network_profile`. If those are clean, the MOS figure is not the problem — look at `voice.jbuf.late_drops`, since a buffer discarding late packets degrades the audio without the network losing anything.\n\nThis monitor exists to be *tripped* during the scripted demo's lossy-wan beat. A silent run means the impairment did not reach the gateway.\n\n@slack-voice-demo",
+  "tags": ["service:voicegw", "env:demo", "team:voice-demo", "layer:network"],
+  "options": {
+    "thresholds": { "critical": 3.0, "warning": 3.6 },
+    "notify_no_data": false,
+    "renotify_interval": 0,
+    "include_tags": true,
+    "new_group_delay": 60,
+    "evaluation_delay": 60
+  }
+}

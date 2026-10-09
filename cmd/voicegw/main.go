@@ -10,10 +10,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"strconv"
@@ -95,6 +97,8 @@ func main() {
 		ddTracePort = flag.String("dd-trace-port", envOr("DD_TRACE_AGENT_PORT", "8126"), "Datadog APM port")
 		ddStatsPort = flag.String("dd-statsd-port", envOr("DD_DOGSTATSD_PORT", "8125"), "DogStatsD port")
 		callLogPath = flag.String("call-log", envOr("VOICE_CALL_LOG", "-"), `call log destination; "-" is stdout`)
+		httpAddr    = flag.String("http-addr", envOr("VOICE_HTTP_ADDR", ":8080"),
+			`address for /chaos and /healthz; "" disables it`)
 	)
 	flag.Parse()
 
@@ -181,10 +185,14 @@ func main() {
 	}
 	defer callLog.Close()
 
-	tel := telemetry{tracer: tracerT, callLog: callLog, profile: *profile}
+	// The profile is a live value rather than a constant: /chaos changes it,
+	// and every metric tagged with it has to follow, or a beat's latency would
+	// be attributed to the profile that was in effect before it.
+	tel := telemetry{tracer: tracerT, callLog: callLog, profile: newProviderProfile(*profile)}
 
 	if err := run(runConfig{
 		mediaAddr:        *addr,
+		httpAddr:         *httpAddr,
 		grpcAddr:         *grpcAddr,
 		reportInterval:   *interval,
 		idleTimeout:      *idle,
@@ -201,7 +209,7 @@ func main() {
 type telemetry struct {
 	tracer  *obs.Tracer
 	callLog *obs.CallLog
-	profile string
+	profile *providerProfile
 }
 
 func envOr(key, fallback string) string {
@@ -258,6 +266,35 @@ type providers struct {
 	// closers release the cloud clients at shutdown. Empty for the mocks,
 	// which hold no connections.
 	closers []func() error
+
+	// faults are the provider impairment injectors, kept so the live /chaos
+	// endpoint can retune them mid-call. They exist even on a clean run, which
+	// is what Tunable buys.
+	faults providerFaults
+}
+
+// providerFaults bundles the three injectors the live endpoint retunes.
+type providerFaults struct {
+	stt *faults.Injector
+	llm *faults.Injector
+	tts *faults.Injector
+}
+
+// tunableProvider is implemented by the fault-injecting wrappers. The three
+// packages each have their own unexported wrapper type, so this is how the
+// gateway reaches the injector without any of them exporting it.
+type tunableProvider interface {
+	Injector() *faults.Injector
+}
+
+// injectorOf extracts a wrapped provider's injector. It returns nil for an
+// unwrapped provider, which with Tunable set should not happen — so the caller
+// treats nil as a programming error rather than papering over it.
+func injectorOf(v any) *faults.Injector {
+	if t, ok := v.(tunableProvider); ok {
+		return t.Injector()
+	}
+	return nil
 }
 
 // close releases every provider's resources, reporting failures rather than
@@ -445,37 +482,56 @@ func buildProviders(ctx context.Context, pv chaos.Provider, seed int64,
 			r, codec.SampleRate8k)
 	}
 
+	// Tunable on all three: the wrappers stay in place even when the profile
+	// is clean, so /chaos can turn conditions on mid-demo.
 	faultySTT, err := stt.WithFaults(transcriber, faults.Config{
-		ExtraLatency: ms(pv.STTExtraLatencyMs), ErrorRate: pv.STTErrorRate, Seed: seed,
+		ExtraLatency: ms(pv.STTExtraLatencyMs), ErrorRate: pv.STTErrorRate,
+		Seed: seed, Tunable: true,
 	})
 	if err != nil {
 		return providers{}, err
 	}
 	faultyLLM, err := llm.WithFaults(agent, faults.Config{
-		ExtraLatency: ms(pv.LLMExtraLatencyMs), ErrorRate: pv.LLMErrorRate, Seed: seed + 1,
+		ExtraLatency: ms(pv.LLMExtraLatencyMs), ErrorRate: pv.LLMErrorRate,
+		Seed: seed + 1, Tunable: true,
 	})
 	if err != nil {
 		return providers{}, err
 	}
 	faultyTTS, err := tts.WithFaults(synth, faults.Config{
-		ExtraLatency: ms(pv.TTSExtraLatencyMs), Seed: seed + 2,
+		ExtraLatency: ms(pv.TTSExtraLatencyMs), Seed: seed + 2, Tunable: true,
 	})
 	if err != nil {
 		return providers{}, err
 	}
 
-	return providers{
+	p := providers{
 		stt: faultySTT, llm: faultyLLM, tts: faultyTTS, tools: tools,
 		sttDescription: sttDesc,
 		llmDescription: agentDesc,
 		ttsDescription: ttsDesc,
 		forget:         forget,
 		closers:        closers,
-	}, nil
+		faults: providerFaults{
+			stt: injectorOf(faultySTT),
+			llm: injectorOf(faultyLLM),
+			tts: injectorOf(faultyTTS),
+		},
+	}
+	if p.faults.stt == nil || p.faults.llm == nil || p.faults.tts == nil {
+		// Tunable was supposed to guarantee a wrapper on every provider. If one
+		// is missing, /chaos would silently do nothing for that stage, which is
+		// worse during a demo than refusing to start.
+		return providers{}, fmt.Errorf(
+			"a provider is not impairable: stt=%v llm=%v tts=%v",
+			p.faults.stt != nil, p.faults.llm != nil, p.faults.tts != nil)
+	}
+	return p, nil
 }
 
 type runConfig struct {
 	mediaAddr        string
+	httpAddr         string
 	grpcAddr         string
 	reportInterval   time.Duration
 	idleTimeout      time.Duration
@@ -543,6 +599,44 @@ func run(cfg runConfig) error {
 			log.Printf("control plane: %v", err)
 		}
 	}()
+
+	// The live impairment endpoint. A failure to bind is logged rather than
+	// fatal: a gateway that can serve calls but not /chaos is still a working
+	// gateway, and killing a demo over a port collision would be worse than
+	// losing the ability to change beats without a restart.
+	if cfg.httpAddr != "" {
+		api := &chaosAPI{
+			faults:    cfg.providers.faults,
+			profile:   cfg.tel.profile,
+			liveCalls: func() int { return len(gw.live()) },
+		}
+		srv := &http.Server{
+			Addr:              cfg.httpAddr,
+			Handler:           api.routes(),
+			ReadHeaderTimeout: 5 * time.Second,
+		}
+		httpLis, err := net.Listen("tcp", cfg.httpAddr)
+		if err != nil {
+			log.Printf("not serving /chaos: %v", err)
+		} else {
+			log.Printf("chaos endpoint on http://%s/chaos", httpLis.Addr())
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				if err := srv.Serve(httpLis); err != nil && !errors.Is(err, http.ErrServerClosed) {
+					log.Printf("chaos endpoint: %v", err)
+				}
+			}()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-ctx.Done()
+				shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = srv.Shutdown(shutdownCtx)
+			}()
+		}
+	}
 
 	wg.Add(1)
 	go func() {

@@ -162,8 +162,10 @@ SIP itself.
 
 ## 3. Chaos / realism toggles
 
-Two independent injection points, both live-tunable via `POST /chaos` (and settable by
-env) so conditions can be flipped mid-demo while a dashboard is on screen.
+Two independent injection points. The provider side is live-tunable via `POST /chaos`
+(built in phase 8 — finding 45) so conditions can be flipped mid-demo while a dashboard is
+on screen; the network side belongs to the client and is set per run, because the gateway
+cannot degrade or even observe the impairment of a stream it only receives (finding 24).
 
 **Client-side (network — most realistic):**
 `--loss-pct`, `--loss-burst` (Gilbert-Elliott burst model), `--jitter-ms`,
@@ -187,7 +189,7 @@ env) so conditions can be flipped mid-demo while a dashboard is on screen.
 Every phase ends green before the next starts. The `mock` providers land in phase 4, so
 nothing after it requires cloud credentials or incurs API spend to test.
 
-**Progress: phases 0 through 7 are complete, plus the control plane** (which was
+**Progress: phases 0 through 8 are complete, plus the control plane** (which was
 originally deferred to Appendix A as "real SIP signaling" but turned out to be load-bearing
 for four separate measurement problems — see findings 25-28). See
 [§7 Findings](#7-findings-from-the-implementation) for what the implementation taught us,
@@ -346,16 +348,51 @@ recognizer instead of a mock written to degrade.
 re-login here and the local ADC has no quota project, so the live tests skip. The failures
 seen while getting that far are what produced finding 40.
 
-### Phase 8 — Load generator + demo script + dashboard
+### Phase 8 — Load generator + demo script + dashboard (done)
 
-- `voicectl load --calls 50 --concurrency 10 --profile lossy-wan --duration 60s`
-- Several distinct WAV fixtures so transcripts and LLM replies vary
-- Adapt `sip_log_generator.py` to emit SIP signaling logs keyed to the same `call_id`
-- `make demo` → scripted beats: `clean` → `mobile` → `lossy-wan` → `provider-degraded`
-- Datadog dashboard JSON + a couple of monitors, checked into `deploy/datadog/`
+- `internal/loadgen` — one call's setup/stream/teardown, and a concurrency-limited run over
+  many of them. `voicectl send` was refactored onto the same code, because a load run that
+  set its calls up differently from the single-call demo would be measuring something else
+  (finding 43).
+- `voicectl load -calls 50 -concurrency 10 -profile clean,mobile,lossy-wan` — profiles and
+  fixtures cycle across calls, and From/To come from a small pool so the trace list looks
+  like a switchboard. Reproducible: the same seed replays the same run.
+- Fixtures vary in **duration**, not content, and finding 44 explains why that is the only
+  dimension that matters with the mock recognizer. `voicectl fixtures` writes them out as
+  WAVs; `-fixtures <dir>` takes real speech for a `-real-stt` run.
+- **A live `/chaos` endpoint** on the gateway, which §3 always called for and which turned
+  out to be the thing that makes a scripted demo possible at all (finding 45). Plus
+  `/healthz`, which the demo script waits on.
+- `deploy/sip/sip_log_generator.py` reads the gateway's call log and emits the SIP signaling
+  those calls would have produced, carrying the same `call_id` in the `Call-ID` header.
+- `make demo` → `deploy/demo.sh`: four beats, no gateway restart between them, each one
+  printing what to look at (finding 46).
+- `network_profile` is now a metric tag, which is what lets the dashboard put the beats side
+  by side instead of separating them by time (finding 47). Four monitors in
+  `deploy/datadog/monitors/`, with a test holding their thresholds against the impairment
+  the demo actually produces.
 
-**Test:** 50 concurrent calls with no goroutine leaks (`goleak`), no dropped calls, and
-each profile change visibly reflected on the dashboard.
+**Test:** `internal/loadgen` runs 50 calls ten at a time against a miniature real gateway —
+a real control plane, a real UDP media port, real per-SSRC RTP accounting, with only the AI
+pipeline removed — and asserts that every call completes, that peak concurrency respects the
+cap, and that **every loss figure reconciles**: the gateway independently measured exactly
+the packets the client dropped, on all fifty. `goleak` runs over the whole package via
+`TestMain`. Separate tests pin that the profiles are distinguishable (`lossy-wan` must lose
+more than `clean` and score worse MOS, or the demo has nothing to show), that a run is
+reproducible, and that a cancelled run still tears its calls down.
+
+Verified end to end against the real gateway and the full pipeline: four beats, 16 calls,
+loss reconciling on every one.
+
+| beat (network / provider) | loss | concealed | MOS | confidence | max turn |
+|---|---|---|---|---|---|
+| clean / clean | 0.00% | 0.00% | 4.41 | 0.950 | — |
+| mobile / clean | 1.46% | 1.46% | 3.56 | 0.940 | — |
+| lossy-wan / clean | 5.71% | 6.70% | 2.08 | 0.922 | — |
+| clean / provider-degraded | 0.00% | 0.00% | 4.41 | 0.950 | 6001 ms |
+
+The last row is the one that makes the whole design legible: a pristine network with a sick
+provider leaves every transport figure untouched and moves only the span durations.
 
 ### Phase 9 — Demo polish (before the customer session)
 
@@ -375,6 +412,7 @@ UI can be added later if the customer session calls for it.
 | `llmobs` SDK is EXPERIMENTAL | Pin dd-trace-go v2; confine all SDK calls to `internal/obs` |
 | STT/TTS don't map cleanly to "LLM" semantics | Use `billable_character_count` + `time_to_first_token`; the phase-6 LLM turn carries the token/cost story |
 | Google STT cost during load tests | Mock providers are the default; real providers opt-in per run and behind a build tag in CI |
+| A dashboard cleared by restarting the gateway between demo beats | `POST /chaos` retunes provider impairment live; the network side is per-run on the client, so no beat needs a restart |
 | Google streaming recognition's 5-minute cap | The provider stops sending at 4m30s and lets results drain, so recognition ends cleanly instead of the service aborting the stream mid-call |
 | Flaky timing-dependent tests | Fake clock in the jitter buffer; tolerance-based assertions elsewhere |
 | Google streaming API 5-minute stream limit | Cap synthetic call duration; document the constraint |
@@ -749,6 +787,58 @@ What the implementation changed about the plan. Findings 1-7 are from phases 0-2
     send side's error now gives way to the receive side's whenever it is uninformative, and
     a cancelled context — which is how *every* call ends — is not reported as a failure at
     all. Two tests pin both halves.
+
+43. **The load generator had to be the single-call path, not a second one.** Writing
+    `voicectl load` as its own implementation would have been easier and would have
+    quietly invalidated the demo: two code paths setting calls up differently measure
+    different things, and the argument the dashboards make depends on a load run and a
+    single call being the same call. So `internal/loadgen` owns one `Place`, and
+    `voicectl send` was refactored onto it, keeping only what is genuinely single-call —
+    the reply listener, the WAV save, the two-sided reconciliation printout. The
+    `-no-signaling` path stayed separate on purpose: it has no control plane at all, which
+    is the entire point of it.
+
+44. **Varied audio fixtures do not vary the conversation; varied *lengths* do.** The plan
+    asked for several distinct WAV files so transcripts and replies would differ across a
+    load run. With the mock recognizer that reasoning does not hold: the mock finalizes an
+    utterance every N frames *consumed* and cycles its phrase list from the start of each
+    call (finding 12 — deliberately a function of logical progress, not content). So two
+    different waveforms of the same length produce byte-identical conversations, while a
+    2.5 s call and an 11 s call produce two turns and six. The built-in fixtures therefore
+    vary duration, and vary pitch only so a person can tell them apart by ear. Content
+    matters again under `-real-stt`, which is what `-fixtures <dir>` is for. Verified: the
+    four-beat run produced 2, 3, 4, 5 and 6-turn calls from the five fixtures.
+
+45. **The demo needed the live endpoint more than it needed the load generator.** `/chaos`
+    was in §3 from the start and never built, because nothing until now required it. It
+    turns out to be load-bearing for the scripted demo: flipping a beat by restarting the
+    gateway clears every live graph and the call list, which costs the audience's attention
+    at exactly the moment the comparison is being made. Three things fell out of building
+    it. The fault wrappers had to survive a *clean* start — `faults.Config.Tunable`, since
+    `WithFaults` otherwise returns the provider unwrapped and a gateway started clean has
+    nothing to turn on. The profile name had to become a live value rather than a startup
+    constant, because it is a metric tag: a beat's latency tagged with the previous beat's
+    profile would have made the dashboard actively wrong. And the retune has to be atomic —
+    a half-applied request leaves conditions no profile describes, which is the worst thing
+    to be looking at on a dashboard.
+
+46. **A demo script's hardest part is the order of the beats, not the automation.** The four
+    beats are ordered so each answers the question the previous one raises: `clean`
+    establishes what healthy looks like (without it every later number is unanchored),
+    `mobile` shows light impairment is visible at all, `lossy-wan` makes the central claim
+    that packet loss degrades AI quality, and `provider-degraded` is the control — because
+    an audience that has just watched the network hurt the agent will ask how you would
+    tell a sick network from a sick provider. The answer is on screen: transport panels
+    return to baseline while span durations blow out. Each beat prints what to watch, so
+    the script is also the narration.
+
+47. **The beats were invisible to the metrics until the client's profile became a tag.**
+    Every metric carried `provider_profile` but nothing carried the *network* profile, so a
+    dashboard could only separate beats by time — and "the numbers changed around 14:32" is
+    a far weaker claim than two labeled series in one graph. The control plane has carried
+    the client's declared profile since the phase-5 work (finding 24 anticipated exactly
+    this), so the fix was to put it on `obs.CallTags` and use it. The dashboard gained a
+    beat-comparison row split by it, and `$network_profile` as a template variable.
 
 Also worth noting for later phases: `Session` reports current and maximum jitter but not
 percentiles, because computing p95 would require retaining per-packet samples. Phase 5

@@ -23,8 +23,8 @@ See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 | — | gRPC control plane (call setup/teardown) | done |
 | 6 | LLM in the loop (real agent, tool definitions, cost, evaluations) | done |
 | 7 | Real Google STT/TTS | done |
-| 8 | Load generator, demo script, dashboard | next |
-| 9 | Demo polish | |
+| 8 | Load generator, demo script, dashboard, monitors | done |
+| 9 | Demo polish | next |
 
 The whole call path works and is fully instrumented: RTP in, jitter buffer, transcript,
 agent reply with a tool call, synthesized audio out — reported as APM traces, Agent
@@ -36,6 +36,9 @@ the defaults: `make test` needs no credentials and spends nothing. `-real-stt` s
 Google Speech-to-Text v2, `-real-tts` Google Text-to-Speech, `-real-llm` Claude — each
 independently. Telemetry is off by default, so the demo also runs with no Datadog agent at
 all.
+
+`voicectl load` drives many calls at once and `make demo` runs the four scripted beats
+against a dashboard, changing conditions over `/chaos` without ever restarting the gateway.
 
 ## Quick start
 
@@ -107,8 +110,14 @@ Two things to notice, because they are the connection the demo exists to draw:
 
 ### Seeing a degraded provider
 
+Either at startup, or live on a gateway that is already serving calls:
+
 ```bash
 ./bin/voicegw -addr 127.0.0.1:5004 -provider-profile provider-degraded -idle-timeout 1s
+```
+
+```bash
+curl -X POST localhost:8080/chaos -d '{"profile":"provider-degraded"}'
 ```
 
 The same call then reports `first_partial=2.001s` instead of 621 ms, and `llm=6.005s` on
@@ -193,6 +202,121 @@ contrast demonstrable:
 ```
 
 Pass `-require-signaling` to the gateway to reject unsignaled media instead.
+
+## Load, and the scripted demo
+
+`voicectl load` places many calls at once, over the same code path `voicectl send` uses for
+one. Profiles and audio fixtures cycle across calls, and the caller numbers come from a
+small pool, so a run looks like a switchboard rather than one number dialing itself:
+
+```bash
+./bin/voicectl load -calls 50 -concurrency 10 -profile clean,mobile,lossy-wan
+```
+
+It reports both sides' accounting and the per-profile comparison that is the whole point:
+
+```
+  packets:   sent=1738 dropped=37 | gateway received=1738 lost=37
+  loss reconciles on all 6 calls: every loss figure is exact
+
+  profile              calls  loss      jitter      mos   conceal   turns
+  clean                    3    0.00%      0.3ms   4.41    0.00%      12
+  lossy-wan                3    3.32%     28.9ms   3.01    4.15%      10
+```
+
+"Loss reconciles" is the line to read first. It means the gateway independently measured
+exactly the packets the client knows it dropped, working only from sequence gaps — so every
+loss figure on the dashboard is exact rather than a lower bound.
+
+`-duration` bounds a run by time instead of by call count, `-seed` replays an earlier run
+exactly, and `-fixtures <dir>` calls with real speech instead of the built-in synthetic set.
+
+**The built-in fixtures vary in length, not content**, and that is not a shortcut: the mock
+recognizer finalizes an utterance every fixed number of frames *consumed*, so what varies a
+call's conversation is how much audio it carries — 2.5 seconds gives two turns, 11 seconds
+gives six. Two different waveforms of the same length would produce identical transcripts.
+Content matters again under `-real-stt`, which is what `-fixtures` is for. Write the
+synthetic set out to listen to it:
+
+```bash
+make fixtures
+```
+
+### Changing conditions without restarting
+
+The gateway serves `/chaos` on `:8080`. Provider impairment is live-tunable, which is what
+lets a demo change beats with a dashboard already on screen — a restart would clear every
+live graph and the call list:
+
+```bash
+curl -X POST localhost:8080/chaos -d '{"profile":"provider-degraded"}'
+```
+
+```bash
+curl -X POST localhost:8080/chaos -d '{"llm_latency_ms":1500}'
+```
+
+A named profile replaces the provider settings wholesale, so `{"profile":"clean"}` really
+does clear the previous beat; individual knobs refine whatever is in effect. The profile tag
+on every metric follows the endpoint, so a beat's numbers are never labeled with the
+previous beat's profile.
+
+Network impairment is **not** settable here, and the response says so. It belongs to the
+client: nothing in an RTP stream says how it was degraded, so the gateway cannot apply or
+even observe it.
+
+`GET /chaos` reports the current settings plus what has actually been injected, and
+`/healthz` reports liveness, the live call count, and which beat the gateway is in.
+
+### make demo
+
+Four beats against a gateway you already started:
+
+```bash
+make demo
+```
+
+| Beat | Network | Provider | What it shows |
+|---|---|---|---|
+| 1 | `clean` | `clean` | the baseline — without it every later number is unanchored |
+| 2 | `mobile` | `clean` | light impairment is visible at all |
+| 3 | `lossy-wan` | `clean` | **the claim**: loss reaches the AI layer and degrades confidence |
+| 4 | `clean` | `provider-degraded` | the control — how to tell a sick network from a sick provider |
+
+Measured over a real four-beat run:
+
+| Beat | loss | concealed | MOS | confidence | max turn |
+|---|---|---|---|---|---|
+| clean | 0.00% | 0.00% | 4.41 | 0.950 | — |
+| mobile | 1.46% | 1.46% | 3.56 | 0.940 | — |
+| lossy-wan | 5.71% | 6.70% | 2.08 | 0.922 | — |
+| provider-degraded | 0.00% | 0.00% | 4.41 | 0.950 | 6001 ms |
+
+The last row is the design in one line: a pristine network with a sick provider leaves every
+transport figure untouched and moves only the span durations. That is why transport lives in
+APM and the AI layer lives in Agent Observability.
+
+`CALLS`, `CONCURRENCY` and `BEAT_PAUSE` tune it. Raise `BEAT_PAUSE` for a customer session —
+Datadog's rollup makes a beat shorter than a minute hard to separate on a dashboard.
+
+### SIP signaling logs
+
+SIP itself is out of scope (decision 3), but the *correlation* is not.
+[deploy/sip/sip_log_generator.py](deploy/sip/sip_log_generator.py) reads the gateway's call
+log and emits the signaling those calls would have produced, carrying the same `call_id` in
+the `Call-ID` header:
+
+```bash
+make sip-logs CALL_LOG=/tmp/calls.jsonl
+```
+
+A search for one `call_id` in Datadog logs then finds the INVITE, the BYE with that call's
+loss and MOS figures attached, the media record, and the trace holding the transcript and
+the agent's reply. The timings and parties are real — derived from a call that happened over
+the gRPC control plane — while the protocol text around them is a reconstruction. It is
+adapted from the standalone generator in the `rum-install` repo, which invented random calls;
+this one describes calls that actually took place, which is what makes the shared identifier
+worth anything.
 
 ## Running the real speech providers
 
@@ -317,10 +441,21 @@ make up
 make dashboard
 ```
 
-`make dashboard` needs `DD_API_KEY` and `DD_APP_KEY`. The dashboard definition lives in
-[deploy/datadog/dashboard.json](deploy/datadog/dashboard.json), and a test asserts every
-metric it charts is one the code actually emits — an empty graph during a demo is
-indistinguishable from a healthy system, so the two cannot be allowed to drift.
+```bash
+make monitors
+```
+
+Both need `DD_API_KEY` and `DD_APP_KEY`. The dashboard lives in
+[deploy/datadog/dashboard.json](deploy/datadog/dashboard.json) and the four monitors in
+[deploy/datadog/monitors/](deploy/datadog/monitors), and tests assert every metric they
+query is one the code actually emits — an empty graph or an alert that cannot fire is
+indistinguishable from a healthy system, so the two cannot be allowed to drift. A further
+test holds the monitor thresholds against the impairment the scripted demo actually
+produces, so a beat that was supposed to trip an alert still does.
+
+The dashboard's **beat row** is the one to read during a demo: loss, concealed audio and MOS
+split by `network_profile`, so the beats appear as labeled series side by side rather than as
+a change at a point in time. `$network_profile` filters the whole dashboard to one beat.
 
 ### What gets reported
 
@@ -396,7 +531,7 @@ make help
 ```
 
 `build` `test` `test-integration` `cover` `fuzz` `lint` `tidy` `proto` `up` `down` `logs`
-`agent-status` `demo`
+`agent-status` `dashboard` `monitors` `demo` `load` `fixtures` `sip-logs`
 
 `make test` is fully offline — no cloud credentials, no API spend. Tests that hit real
 providers live behind `-tags=integration` and run via `make test-integration`.
