@@ -8,6 +8,7 @@ The point of the project is **demonstrating how to instrument this flow with Dat
 The media path is authentic because that is what makes the loss/jitter/MOS metrics real;
 SIP signaling is deliberately out of scope.
 
+See [docs/user-guide.md](docs/user-guide.md) for commands, flags, and worked examples.
 See [docs/plan.md](docs/plan.md) for the full design and phase plan.
 
 ## Status
